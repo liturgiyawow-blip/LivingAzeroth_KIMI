@@ -43,18 +43,17 @@ world_state = WorldState(config.WORLD_STATE_FILE)
 llm_queue = PriorityLLMQueue(config.LLM_BASE_URL)
 event_bus = EventBus()
 
-# Мост к WoW
+# Мост к WoW (MySQL)
 db_bridge = WoWDBBridge()
-
 
 # Реестр модулей
 registry = ModuleRegistry(app, world_state, llm_queue, event_bus)
 
-# Модуль Creature AI
+# Модуль Creature AI (NPC + боты)
 creature_handler = CreatureAIHandler(world_state, llm_queue, event_bus, db_bridge)
 registry.register_module("creature_ai", creature_handler)
 
-# Запуск DB Bridge
+# Запуск DB Bridge (начать polling MySQL)
 db_bridge.start()
 
 # ─── ЭНДПОИНТЫ ───
