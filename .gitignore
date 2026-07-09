@@ -1,0 +1,35 @@
+# === Python (Кэш и компилированные файлы) ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.creature.txt
+*.player.txt
+
+# === Виртуальное окружение (если создашь его локально) ===
+venv/
+.venv/
+env/
+ENV/
+
+# === Логи (чтобы не забивать гит историей текстовых логов) ===
+logs/
+*.log
+
+# === Временные файлы и локальные базы данных/дампы ===
+bridge/*.jsonl
+data/*.json
+
+# === СЕКРЕТЫ И ПАРОЛИ (Критически важно!) ===
+.env
+.env.local
+config.private.py
+разработыч_тхт/
+Text Document.txt
+
+# === Мусор операционных систем и сред разработки ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
