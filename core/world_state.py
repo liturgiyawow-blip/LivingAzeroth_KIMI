@@ -27,6 +27,7 @@ class WorldState:
         self._data = {}
         self._dirty = False
         self._timer = None
+        self._running = True
         
         # Загрузка или создание дефолта
         self._load_or_create()
@@ -51,6 +52,7 @@ class WorldState:
             },
             "creatures": {},
             "players": {},
+            "entities": {},  # <-- FIX: хранилище по GUID для handlers.py
             "world_events": {
                 "active_invasions": [],
                 "weather": "sunny",
@@ -105,13 +107,28 @@ class WorldState:
         return obj
     
     def _start_auto_save(self):
-        def auto_save():
-            self._save_to_disk()
-            self._timer = threading.Timer(60.0, auto_save)
-            self._timer.daemon = True
-            self._timer.start()
+        """FIX: перезапуск таймера без утечки ссылок."""
+        def _tick():
+            if not self._running:
+                return
+            try:
+                self._save_to_disk()
+                self._check_memory()
+                logger.debug("Auto-save tick")
+            except Exception as e:
+                logger.error("Auto-save error: %s", e)
+            finally:
+                # Перезапускаем только если всё ещё работаем
+                if self._running:
+                    self._timer = threading.Timer(60.0, _tick)
+                    self._timer.daemon = True
+                    self._timer.start()
         
-        self._timer = threading.Timer(60.0, auto_save)
+        # Отменяем старый таймер перед созданием нового
+        if self._timer:
+            self._timer.cancel()
+        
+        self._timer = threading.Timer(60.0, _tick)
         self._timer.daemon = True
         self._timer.start()
     
@@ -161,30 +178,62 @@ class WorldState:
             self._data["creatures"][name].update(updates)
             self._dirty = True
     
-    def get_full_context(self, npc_name: str = None) -> dict:
+    def get_full_context(self, npc_guid: str = None) -> dict:
+        """
+        FIX: ищем по GUID в entities, а не по имени в creatures.
+        handlers.py передаёт str(npc_guid), поэтому ключ — guid.
+        """
         with self._lock:
             ctx = {
                 "meta": dict(self._data.get("meta", {})),
                 "chronology": list(self._data.get("chronology", {}).get("global", [])),
                 "world_events": dict(self._data.get("world_events", {})),
             }
-            if npc_name:
-                ctx["npc"] = dict(self._data.get("creatures", {}).get(npc_name, {}))
+            if npc_guid:
+                # Ищем в entities по GUID (куда пишет handlers.py)
+                entity = self._data.get("entities", {}).get(str(npc_guid), {})
+                if not entity:
+                    # Fallback: попробуем найти по имени в creatures (legacy)
+                    entity = self._data.get("creatures", {}).get(str(npc_guid), {})
+                ctx["npc"] = dict(entity)
             return ctx
+    
+    def _deep_size(self, obj, seen=None) -> int:
+        """FIX: рекурсивный подсчёт примерного размера объекта в байтах."""
+        if seen is None:
+            seen = set()
+        obj_id = id(obj)
+        if obj_id in seen:
+            return 0
+        seen.add(obj_id)
+        
+        size = sys.getsizeof(obj)
+        if isinstance(obj, dict):
+            size += sum(self._deep_size(k, seen) + self._deep_size(v, seen) for k, v in obj.items())
+        elif isinstance(obj, (list, tuple, set, deque)):
+            size += sum(self._deep_size(i, seen) for i in obj)
+        return size
+    
+    def _check_memory(self, limit_mb: int = 10):
+        with self._lock:
+            size = self._deep_size(self._data)
+            if size > limit_mb * 1024 * 1024:
+                logger.warning("World state RAM %.1fMB > %dMB, trimming...", size / 1048576, limit_mb)
+                gc.collect()
     
     def get_size_mb(self) -> float:
         with self._lock:
-            size = sys.getsizeof(self._data)
-            # Примерная оценка вложенных объектов
-            if size > 10_485_760:  # 10 MB
-                gc.collect()
-            return size / (1024 * 1024)
+            return self._deep_size(self._data) / (1024 * 1024)
     
     def force_save(self):
         logger.info("Force saving world state...")
         self._save_to_disk()
     
     def shutdown(self):
+        """FIX: отмена таймера + форсированное сохранение."""
+        self._running = False
         if self._timer:
             self._timer.cancel()
+            self._timer = None
         self.force_save()
+        logger.info("WorldState shutdown")

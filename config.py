@@ -6,15 +6,11 @@ Living Azeroth — конфигурация
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-import os
 
-load_dotenv() # Загрузит переменные из .env файла
-
-# И ниже в коде используешь:
-
+load_dotenv()  # Загружает переменные из .env файла
 
 # ─── ПУТИ ───
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).parent.resolve()
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
 
@@ -30,7 +26,7 @@ LLM_MOCK_MODE = False  # ← БОЕВОЙ РЕЖИМ, БЕЗ ЗАГЛУШЕК
 MYSQL_HOST = "127.0.0.1"
 MYSQL_PORT = 3306
 MYSQL_USER = os.getenv("MYSQL_USER", "acore")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "acore") # "acore" — дефолт, если .env не найден
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "acore")  # дефолт, если .env не найден
 MYSQL_DB_WORLD = "acore_world"
 MYSQL_DB_CHARACTERS = "acore_characters"  # сюда пишем наши таблицы
 

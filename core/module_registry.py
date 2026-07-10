@@ -3,7 +3,7 @@ ModuleRegistry — регистратор модулей
 """
 
 import logging
-from typing import Dict, Callable, Optional
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -14,13 +14,13 @@ class ModuleRegistry:
         self.world = world_state
         self.llm = llm_queue
         self.bus = event_bus
-        self._handlers: Dict[str, Callable] = {}
+        self._handlers: Dict[str, Any] = {}
     
-    def register_module(self, name: str, handler):
+    def register_module(self, name: str, handler: Any):
         self._handlers[name] = handler
         logger.info("Module registered: %s", name)
     
-    def get_handler(self, name: str) -> Optional[Callable]:
+    def get_handler(self, name: str) -> Optional[Any]:
         return self._handlers.get(name)
     
     def add_route(self, url: str, view_func, methods=None):

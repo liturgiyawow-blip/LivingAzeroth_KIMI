@@ -1,10 +1,8 @@
---[[
-    Living Azeroth — AI Bridge (v2.3)
-    NO TIMERS. Instant delivery to player. NPC speaks if present.
-]]
+print("[LivingAzeroth] === FILE LOADING ===")
 
 local AI_WORLD = {
     SEARCH_RADIUS = 30,
+    FIND_RADIUS   = 100,
     DEBUG = true,
 }
 
@@ -20,13 +18,59 @@ end
 
 local function EscapeSQL(str)
     if not str then return "" end
-    return tostring(str):gsub("'", "''"):gsub("\\", "\\\\")
+    return tostring(str):gsub("\0", ""):gsub("'", "''"):gsub("\\", "\\\\")
+end
+
+-- ============================================
+-- SAFE PLAYER LOOKUP
+-- ============================================
+local function FindPlayerByGUIDLow(guidLow)
+    local players = GetPlayersInWorld()
+    if not players then return nil end
+    for i = 1, #players do
+        local p = players[i]
+        if p then
+            local ok, low = pcall(function() return p:GetGUIDLow() end)
+            if ok and low == guidLow then return p end
+        end
+    end
+    return nil
+end
+
+-- ============================================
+-- NPC LOOKUP BY GUID LOW (GetCreature wants full GUID)
+-- ============================================
+local function FindCreatureByGUIDLow(player, guidLow)
+    if not player then return nil end
+    
+    local creatures = player:GetCreaturesInRange(AI_WORLD.FIND_RADIUS)
+    if not creatures then return nil end
+    
+    for i = 1, #creatures do
+        local c = creatures[i]
+        if c then
+            local ok, low = pcall(function() return c:GetGUIDLow() end)
+            if ok and low == guidLow then
+                return c
+            end
+        end
+    end
+    
+    -- Fallback: попробуем GetCreature если вдруг сработает
+    local ok, result = pcall(function()
+        return player:GetMap():GetCreature(guidLow)
+    end)
+    if ok and result then
+        local ok2, low = pcall(function() return result:GetGUIDLow() end)
+        if ok2 and low == guidLow then return result end
+    end
+    
+    return nil
 end
 
 -- ============================================
 -- WRITE REQUEST
 -- ============================================
-
 local function WriteRequestToDB(player, target, message, channelType, targetIsPlayer)
     if not player or not target then
         Log("WriteRequestToDB: missing player or target")
@@ -38,15 +82,10 @@ local function WriteRequestToDB(player, target, message, channelType, targetIsPl
     local msg = EscapeSQL(message)
     local channel = EscapeSQL(channelType)
 
-    local tName, tGuid, tEntry
-
-    if targetIsPlayer then
-        tName = EscapeSQL(target:GetName())
-        tGuid = target:GetGUIDLow()
-        tEntry = 0
-    else
-        tName = EscapeSQL(target:GetName())
-        tGuid = target:GetGUIDLow()
+    local tName = EscapeSQL(target:GetName())
+    local tGuid = target:GetGUIDLow()
+    local tEntry = 0
+    if not targetIsPlayer then
         tEntry = target:GetEntry() or 0
     end
 
@@ -68,57 +107,60 @@ local function WriteRequestToDB(player, target, message, channelType, targetIsPl
 end
 
 -- ============================================
--- CHECK FOR RESPONSE (single immediate check)
+-- DELIVER RESPONSE
 -- ============================================
-
-local function CheckAndDeliverResponse(player, targetGuid, targetIsPlayer)
-    if not player then return false end
+local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targetIsPlayer, targetName)
+    local player = FindPlayerByGUIDLow(playerGuid)
+    if not player then
+        Log("Player offline: " .. tostring(playerName))
+        return true
+    end
 
     local sql = string.format(
         "SELECT id, response_text, emote_id, action_command FROM ai_responses " ..
         "WHERE player_guid = %u AND npc_guid = %u AND fetched = 0 ORDER BY created_at DESC LIMIT 1",
-        player:GetGUIDLow(), targetGuid
+        playerGuid, targetGuid
     )
 
     local query = CharDBQuery(sql)
     if not query then
-        return false -- No response yet
+        return false
     end
 
-    local rowId = query:GetUInt32(0)
-    local text = query:GetString(1)
-    local emoteId = query:GetUInt32(2)
+    local rowId     = query:GetUInt32(0)
+    local text      = query:GetString(1)
+    local emoteId   = query:GetUInt32(2)
     local actionCmd = query:GetString(3)
 
-    -- Mark as fetched
     CharDBExecute("UPDATE ai_responses SET fetched = 1, delivered_at = UNIX_TIMESTAMP() WHERE id = " .. rowId)
 
-    -- Try to find target
     local target = nil
     if targetIsPlayer then
-        target = GetPlayerByGUID(targetGuid)
+        target = FindPlayerByGUIDLow(targetGuid)
     else
-        local status, result = pcall(function()
-            return player:GetMap():GetCreature(targetGuid)
-        end)
-        if status then target = result end
+        target = FindCreatureByGUIDLow(player, targetGuid)
     end
 
-    -- DELIVER TO PLAYER (always works)
-    player:SendBroadcastMessage("|cff00ff00[AI Ответ]|r " .. text)
+    if target and not targetIsPlayer then
+        local sayOk = pcall(function() target:SendUnitSay(text, 0) end)
+        if not sayOk then
+            player:SendBroadcastMessage("|cff00ff00[" .. targetName .. "]:|r " .. text)
+        end
+        if emoteId and emoteId > 0 then
+            pcall(function() target:PerformEmote(emoteId) end)
+        end
+        DebugToPlayer(player, "NPC " .. targetName .. " replied via Say")
 
-    -- Try to make target speak (if still valid)
-    if targetIsPlayer and target then
-        target:Say(text, 0)
-        DebugToPlayer(player, "Bot " .. target:GetName() .. " replied")
-
-    elseif target then
-        target:SendUnitSay(text, 0)
-        if emoteId and emoteId > 0 then target:PerformEmote(emoteId) end
-        DebugToPlayer(player, "NPC " .. target:GetName() .. " replied")
+    elseif target and targetIsPlayer then
+        local sayOk = pcall(function() target:Say(text, 0) end)
+        if not sayOk then
+            player:SendBroadcastMessage("|cff00ff00[" .. targetName .. "]:|r " .. text)
+        end
+        DebugToPlayer(player, "Bot " .. targetName .. " replied via Say")
 
     else
-        DebugToPlayer(player, "Target despawned, message shown above")
+        player:SendBroadcastMessage("|cff00ff00[" .. targetName .. "]:|r " .. text)
+        DebugToPlayer(player, "Target not found, text shown with name")
     end
 
     if actionCmd and actionCmd ~= "" and actionCmd ~= "null" then
@@ -129,85 +171,97 @@ local function CheckAndDeliverResponse(player, targetGuid, targetIsPlayer)
 end
 
 -- ============================================
--- SIMPLE POLLING LOOP (global, not per-player)
+-- GLOBAL POLLING
 -- ============================================
+local pendingChecks = {}
+local pollCounter = 0
 
-local pendingChecks = {} -- {playerGuid = {targetGuid, targetIsPlayer, retries}}
+local function GenerateKey(playerGuid)
+    pollCounter = pollCounter + 1
+    return string.format("%u_%u", playerGuid, pollCounter)
+end
 
 local function GlobalPollLoop()
-    for playerGuid, data in pairs(pendingChecks) do
-        local player = GetPlayerByGUID(playerGuid)
-        if player then
-            local success = CheckAndDeliverResponse(player, data.targetGuid, data.targetIsPlayer)
-            if success then
-                pendingChecks[playerGuid] = nil
-            else
-                data.retries = data.retries + 1
-                if data.retries > 60 then -- 30 seconds timeout
-                    player:SendBroadcastMessage("|cffff0000[AI]|r Response timeout.")
-                    pendingChecks[playerGuid] = nil
-                end
-            end
+    for key, data in pairs(pendingChecks) do
+        local done = CheckAndDeliverResponse(
+            data.playerGuid,
+            data.playerName,
+            data.targetGuid,
+            data.targetIsPlayer,
+            data.targetName
+        )
+        if done then
+            pendingChecks[key] = nil
         else
-            pendingChecks[playerGuid] = nil -- Player offline
+            data.retries = data.retries + 1
+            if data.retries > 60 then
+                local p = FindPlayerByGUIDLow(data.playerGuid)
+                if p then
+                    p:SendBroadcastMessage("|cffff0000[AI]|r Response timeout.")
+                end
+                pendingChecks[key] = nil
+            end
         end
     end
 end
 
--- Start global polling (every 500ms)
-CreateLuaEvent(GlobalPollLoop, 500, 0) -- 0 = infinite repeats
-
 -- ============================================
--- CHANNEL HANDLERS
+-- HANDLE SAY (nearest alive NPC)
 -- ============================================
-
 local function HandleSayChannel(player, msg)
     local creatures = player:GetCreaturesInRange(AI_WORLD.SEARCH_RADIUS)
-    local targetNpc = nil
+    if not creatures then
+        DebugToPlayer(player, "No creatures in range")
+        return
+    end
 
-    for _, c in ipairs(creatures) do
-        local valid = false
-        if c and c.IsAlive and c.GetEntry then
-            local status, result = pcall(function() 
-                return c:IsAlive() and c:GetEntry() > 0 
-            end)
-            if status and result then
-                valid = true
+    local targetNpc = nil
+    local targetName = "Unknown"
+    local nearestDist = 999999
+
+    for i = 1, #creatures do
+        local c = creatures[i]
+        if c then
+            local okAlive = pcall(function() return c:IsAlive() end)
+            if okAlive and c:IsAlive() then
+                local okEntry, entry = pcall(function() return c:GetEntry() end)
+                if okEntry and entry and entry > 0 then
+                    local okDist, dist = pcall(function() return player:GetDistance(c) end)
+                    if okDist and dist and dist < nearestDist then
+                        nearestDist = dist
+                        targetNpc = c
+                        local okName, n = pcall(function() return c:GetName() end)
+                        if okName then targetName = n end
+                    end
+                end
             end
-        end
-        
-        if valid then
-            targetNpc = c
-            break
         end
     end
 
     if not targetNpc then
-        DebugToPlayer(player, "No valid NPC found within " .. AI_WORLD.SEARCH_RADIUS .. "m")
+        DebugToPlayer(player, "No valid NPC within " .. AI_WORLD.SEARCH_RADIUS .. "m")
         return
     end
-
-    local status, name = pcall(function() return targetNpc:GetName() end)
-    if not status then
-        DebugToPlayer(player, "NPC became invalid, try again")
-        return
-    end
-
-    DebugToPlayer(player, "Talking to NPC: " .. name)
 
     local npcGuid = targetNpc:GetGUIDLow()
 
     if WriteRequestToDB(player, targetNpc, msg, "SAY", false) then
-        DebugToPlayer(player, "Request sent to AI. Waiting...")
-        -- Register for global polling
-        pendingChecks[player:GetGUIDLow()] = {
-            targetGuid = npcGuid,
+        DebugToPlayer(player, "Talking to NPC: " .. targetName)
+        local key = GenerateKey(player:GetGUIDLow())
+        pendingChecks[key] = {
+            playerGuid     = player:GetGUIDLow(),
+            playerName     = player:GetName(),
+            targetGuid     = npcGuid,
             targetIsPlayer = false,
-            retries = 0
+            targetName     = targetName,
+            retries        = 0,
         }
     end
 end
 
+-- ============================================
+-- HANDLE PARTY
+-- ============================================
 local function HandlePartyChannel(player, msg)
     local group = player:GetGroup()
     if not group then
@@ -216,23 +270,41 @@ local function HandlePartyChannel(player, msg)
     end
 
     local members = group:GetMembers()
+    if not members then
+        DebugToPlayer(player, "Group members nil")
+        return
+    end
+
+    -- DEBUG: сколько членов в группе
+    DebugToPlayer(player, "Group members count: " .. tostring(#members))
+
     local targetBot = nil
+    local targetName = "Unknown"
 
-    for _, member in ipairs(members) do
-        if not member then goto continue end
-        local mGuid = member:GetGUIDLow()
-        if mGuid == player:GetGUIDLow() then goto continue end
+    for i = 1, #members do
+        local member = members[i]
+        if member then
+            local mGuid = member:GetGUIDLow()
+            local mName = member:GetName()
+            DebugToPlayer(player, "Member #" .. i .. ": " .. mName .. " (guid=" .. mGuid .. ")")
 
-        local mName = member:GetName()
-        if msg:lower():find(mName:lower()) or
-           msg:lower():find("бро") or
-           msg:lower():find("пати") or
-           msg:lower():find("все") or
-           msg:lower():find("ребята") then
-            targetBot = member
-            break
+            if mGuid ~= player:GetGUIDLow() then
+                local lowerMsg = msg:lower()
+                local lowerName = mName:lower()
+                local addressed = (lowerMsg:find(lowerName, 1, true) ~= nil)
+                    or (lowerMsg:find("бро", 1, true) ~= nil)
+                    or (lowerMsg:find("пати", 1, true) ~= nil)
+                    or (lowerMsg:find("все", 1, true) ~= nil)
+                    or (lowerMsg:find("ребята", 1, true) ~= nil)
+
+                if addressed then
+                    targetBot = member
+                    targetName = mName
+                    DebugToPlayer(player, "SELECTED bot: " .. mName)
+                    break
+                end
+            end
         end
-        ::continue::
     end
 
     if not targetBot then
@@ -240,39 +312,47 @@ local function HandlePartyChannel(player, msg)
         return
     end
 
-    DebugToPlayer(player, "Addressing bot: " .. targetBot:GetName())
-
     local botGuid = targetBot:GetGUIDLow()
 
     if WriteRequestToDB(player, targetBot, msg, "PARTY", true) then
         DebugToPlayer(player, "Party request sent to AI...")
-        pendingChecks[player:GetGUIDLow()] = {
-            targetGuid = botGuid,
+        local key = GenerateKey(player:GetGUIDLow())
+        pendingChecks[key] = {
+            playerGuid     = player:GetGUIDLow(),
+            playerName     = player:GetName(),
+            targetGuid     = botGuid,
             targetIsPlayer = true,
-            retries = 0
+            targetName     = targetName,
+            retries        = 0,
         }
     end
 end
 
-local function HandleWhisperChannel(player, msg, targetName)
-    if not targetName or targetName == "" then
+-- ============================================
+-- HANDLE WHISPER
+-- ============================================
+local function HandleWhisperChannel(player, msg, targetNameInput)
+    if not targetNameInput or targetNameInput == "" then
         DebugToPlayer(player, "Whisper target not found")
         return
     end
 
-    local target = GetPlayerByName(targetName)
+    local target = GetPlayerByName(targetNameInput)
     if not target then
         local allPlayers = GetPlayersInWorld()
-        for _, p in ipairs(allPlayers) do
-            if p:GetName():lower():find(targetName:lower()) then
-                target = p
-                break
+        if allPlayers then
+            for i = 1, #allPlayers do
+                local p = allPlayers[i]
+                if p and p:GetName():lower():find(targetNameInput:lower(), 1, true) then
+                    target = p
+                    break
+                end
             end
         end
     end
 
     if not target then
-        DebugToPlayer(player, "Bot '" .. targetName .. "' not found")
+        DebugToPlayer(player, "Bot '" .. targetNameInput .. "' not found")
         return
     end
 
@@ -281,16 +361,20 @@ local function HandleWhisperChannel(player, msg, targetName)
         return
     end
 
-    DebugToPlayer(player, "Whispering to: " .. target:GetName())
+    local tName = target:GetName()
+    DebugToPlayer(player, "Whispering to: " .. tName)
 
     local targetGuid = target:GetGUIDLow()
 
     if WriteRequestToDB(player, target, msg, "WHISPER", true) then
-        DebugToPlayer(player, "Whisper request sent to AI...")
-        pendingChecks[player:GetGUIDLow()] = {
-            targetGuid = targetGuid,
+        local key = GenerateKey(player:GetGUIDLow())
+        pendingChecks[key] = {
+            playerGuid     = player:GetGUIDLow(),
+            playerName     = player:GetName(),
+            targetGuid     = targetGuid,
             targetIsPlayer = true,
-            retries = 0
+            targetName     = tName,
+            retries        = 0,
         }
     end
 end
@@ -298,31 +382,36 @@ end
 -- ============================================
 -- MAIN HANDLER
 -- ============================================
-
+-- ============================================
+-- MAIN HANDLER (DIAGNOSTIC VERSION)
+-- ============================================
 local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
+    -- ЛОГ ВСЕГО, что ловит event 18
+    Log(string.format("EVENT18: msgType=%d lang=%d target='%s' msg='%s'", 
+        msgType, lang, tostring(targetName), msg))
+
     if not msg or #msg < 2 then return end
     if msg:sub(1, 1) == "." then return end
 
-    DebugToPlayer(player, string.format("Chat caught: type=%d, lang=%d, msg='%s'", msgType, lang, msg))
-
+    -- Пока НЕ фильтруем по msgType — обрабатываем ВСЁ как SAY для теста
+    -- чтобы понять, какой msgType приходит для PARTY
     if msgType == 1 then
         HandleSayChannel(player, msg)
-    elseif msgType == 2 then
+    elseif msgType == 10 then
         HandlePartyChannel(player, msg)
-    elseif msgType == 6 then
-        HandleWhisperChannel(player, msg, targetName)
-    end
-    -- Debug: log ALL chat types
-    if msgType ~= 1 and msgType ~= 2 and msgType ~= 6 then
-    DebugToPlayer(player, "Unknown msgType: " .. msgType)
+    else
+        -- ВРЕМЕННО: логируем неизвестные типы, но НЕ обрабатываем
+        Log(string.format("UNHANDLED msgType=%d — add to handler if this is PARTY", msgType))
     end
 end
 
 -- ============================================
 -- REGISTRATION
 -- ============================================
-
 RegisterPlayerEvent(18, OnPlayerChat)
-Log("Living Azeroth AI Bridge [v2.3] loaded!")
-Log("Channels: SAY | PARTY | WHISPER")
-Log("NO TIMERS — global polling loop")
+Log("Living Azeroth AI Bridge [v2.5.1] loaded!")
+Log("Channels: SAY | YELL | PARTY | WHISPER")
+Log("FIX: No goto, nearest NPC, full diagnostics")
+
+CreateLuaEvent(GlobalPollLoop, 500, 0)
+Log("GlobalPollLoop started (500ms)")

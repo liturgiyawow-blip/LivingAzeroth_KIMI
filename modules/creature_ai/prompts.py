@@ -2,6 +2,7 @@
 Промпты для LLM — NPC и Боты AzerothCore
 """
 
+
 def build_system_prompt(npc_data: dict, world_context: dict, player_data: dict) -> str:
     """Промпт для обычных NPC (SAY)"""
     npc_name = npc_data.get("name", "Unknown")
@@ -13,7 +14,7 @@ def build_system_prompt(npc_data: dict, world_context: dict, player_data: dict) 
     chronology = world_context.get("chronology", [])
     last_events = "\n".join(chronology[-3:]) if chronology else "Нет недавних событий."
     
-    weather = world_context.get("world_events", {}).get("weather", "ясно")
+    weather = world_context.get("world_events", {}).get("weather", "sunny")
     hour = world_context.get("meta", {}).get("world_hour", 12)
     
     player_rep = player_data.get("reputation", 0)
@@ -47,7 +48,8 @@ def build_system_prompt(npc_data: dict, world_context: dict, player_data: dict) 
   "speech": "текст реплики",
   "emote_id": 0,
   "mood_change": "0",
-  "set_flag": null
+  "set_flag": null,
+  "action_command": null
 }}
 
 ЭМОЦИИ: 0=нет, 1=talk, 3=wave, 14=rude, 18=cry, 25=point

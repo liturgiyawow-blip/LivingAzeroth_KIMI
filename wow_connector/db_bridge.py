@@ -3,7 +3,6 @@ WoWDBBridge — MySQL-based bridge between Python and WoW Eluna
 Replaces file-based polling with direct MySQL queries.
 """
 
-import json
 import time
 import threading
 import logging
@@ -40,6 +39,9 @@ class WoWDBBridge:
         
         # Test connection on init
         self._test_connection()
+        
+        # FIX: не обрабатывать старые запросы после рестарта
+        self._init_last_id()
     
     def _get_conn(self):
         """Создать новое соединение (thread-safe)."""
@@ -57,6 +59,23 @@ class WoWDBBridge:
         except Exception as e:
             logger.error("MySQL connection failed: %s", e)
             raise
+    
+    def _init_last_id(self):
+        """
+        FIX: При старте смотрим MAX(id) в ai_requests.
+        Иначе после рестарта сервер обработает все старые необработанные запросы.
+        """
+        try:
+            conn = self._get_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(id) as max_id FROM ai_requests")
+                row = cur.fetchone()
+                self._last_request_id = row[0] or 0
+                logger.info("Last request id set to %d", self._last_request_id)
+            conn.close()
+        except Exception as e:
+            logger.error("Failed to init last_request_id: %s", e)
+            self._last_request_id = 0
     
     def start(self):
         """Запустить фоновый polling новых запросов."""
@@ -92,14 +111,14 @@ class WoWDBBridge:
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                # Берём запросы новее последнего обработанного
+                # FIX: LIMIT 50 вместо 10 — не теряем запросы при спаме
                 sql = """
                     SELECT id, player_guid, player_name, npc_guid, npc_entry, 
                            npc_name, message, channel_type, target_is_player, created_at
                     FROM ai_requests
                     WHERE id > %s AND processed = 0
                     ORDER BY id ASC
-                    LIMIT 10
+                    LIMIT 50
                 """
                 cur.execute(sql, (self._last_request_id,))
                 rows = cur.fetchall()

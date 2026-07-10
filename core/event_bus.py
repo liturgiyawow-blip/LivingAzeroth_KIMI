@@ -26,6 +26,10 @@ class EventBus:
         with self._lock:
             handlers = self._handlers.get(event_type, []).copy()
         
+        if not handlers:
+            logger.debug("No handlers for event %s", event_type)
+            return
+        
         for handler in handlers:
             try:
                 handler(payload)

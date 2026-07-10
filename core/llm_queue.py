@@ -67,44 +67,36 @@ class PriorityLLMQueue:
             "future": Future(),
         }
         
+        # FIX: PriorityQueue — чем меньше число, тем выше приоритет
         self._queue.put((priority, time.time(), task_id, task))
         logger.debug("Task %d queued (priority %d)", task_id, priority)
         return task["future"]
     
     def _worker_loop(self):
+        """
+        FIX: убрана багоопасная логика peek в self._queue.queue[0].
+        Теперь просто ждём задачу из PriorityQueue — она сама сортирует
+        по приоритету. Нет риска IndexError или race condition.
+        """
         while self._running:
-            task = self._get_next_task()
-            if task is None:
-                time.sleep(0.05)
+            try:
+                priority, timestamp, task_id, task = self._queue.get(timeout=1.0)
+            except queue.Empty:
                 continue
             
             with self._current_lock:
                 self._current_task = task
             
-            result = self._execute_task(task)
-            task["future"].set_result(result)
-            
-            with self._current_lock:
-                self._current_task = None
-    
-    def _get_next_task(self):
-        if self._queue.empty():
-            return None
-        
-        with self._current_lock:
-            if self._current_task is not None:
-                current_priority = self._current_task.get("priority", 2)
-                peek = self._queue.queue[0]
-                next_priority = peek[0]
-                
-                if next_priority < current_priority:
-                    return None
-        
-        try:
-            priority, timestamp, task_id, task = self._queue.get_nowait()
-            return task
-        except queue.Empty:
-            return None
+            try:
+                result = self._execute_task(task)
+                task["future"].set_result(result)
+            except Exception as e:
+                logger.error("Task %d execution failed: %s", task_id, e)
+                task["future"].set_exception(e)
+            finally:
+                with self._current_lock:
+                    self._current_task = None
+                self._queue.task_done()  # FIX: был утерян, очередь не уменьшалась
     
     def _execute_task(self, task: dict) -> dict:
         payload = {
@@ -144,11 +136,27 @@ class PriorityLLMQueue:
         except requests.Timeout:
             logger.error("LLM timeout after %.0f seconds", config.LLM_TIMEOUT)
             self._update_stats(config.LLM_TIMEOUT * 1000, priority, success=False)
-            return {"error": "LLM_TIMEOUT", "fallback": True}
+            return {
+                "error": "LLM_TIMEOUT",
+                "fallback": True,
+                "speech": "Мне нужно подумать...",
+                "emote_id": 0,
+                "mood_change": "0",
+                "action_command": None,
+                "set_flag": None,
+            }
         except Exception as e:
             logger.error("LLM request failed: %s", e)
             self._update_stats(0, priority, success=False)
-            return {"error": str(e), "fallback": True}
+            return {
+                "error": str(e),
+                "fallback": True,
+                "speech": "Что-то пошло не так...",
+                "emote_id": 0,
+                "mood_change": "0",
+                "action_command": None,
+                "set_flag": None,
+            }
     
     def _safe_parse_json(self, content: str) -> dict:
         content = content.strip()
@@ -174,7 +182,15 @@ class PriorityLLMQueue:
             pass
         
         logger.warning("JSON parse failed, returning raw text")
-        return {"speech": content[:500], "action_animation": "0", "fallback": True}
+        # FIX: возвращаем полный dict с action_command, чтобы validators не падал
+        return {
+            "speech": content[:500],
+            "emote_id": 0,
+            "mood_change": "0",
+            "set_flag": None,
+            "action_command": None,
+            "fallback": True,
+        }
     
     def _update_stats(self, latency_ms: float, priority: int, success: bool):
         with self._stats_lock:

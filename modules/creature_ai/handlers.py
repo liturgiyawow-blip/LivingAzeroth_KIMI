@@ -4,9 +4,10 @@ CreatureAIHandler — обработчик диалогов с NPC и ботам
 """
 
 import time
+import hashlib
 import threading
 import logging
-from typing import Dict
+from typing import Dict, Tuple
 
 import config
 from core.world_state import WorldState
@@ -27,14 +28,21 @@ class CreatureAIHandler:
         self.bus = event_bus
         self.db = db_bridge
         
-        self._last_talk: Dict[str, float] = {}  # npc_guid -> timestamp
-        self._cache: Dict[str, dict] = {}        # npc_guid -> response
+        # FIX: кэш по (player_guid, hash_текста), а не только по npc_guid.
+        # Иначе при спаме NPC отвечал старым ответом на новый вопрос.
+        self._last_talk: Dict[int, float] = {}  # player_guid -> timestamp
+        self._cache: Dict[Tuple[int, str], dict] = {}  # (player_guid, text_hash) -> response
         self._cache_ttl = 3.0  # секунды
         
         # Подписаться на события от DB Bridge
         self.db.register_callback(self._on_chat_request)
         
         logger.info("CreatureAIHandler initialized")
+    
+    @staticmethod
+    def _text_hash(text: str) -> str:
+        """FIX: хэш текста сообщения для кэша."""
+        return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
     
     def _on_chat_request(self, request: dict):
         """Вызывается когда DB Bridge находит новый запрос из игры"""
@@ -48,20 +56,22 @@ class CreatureAIHandler:
         channel = request.get("channel_type", "SAY")
         is_player = request.get("target_is_player", False)
         
-        # Rate limit: не чаще раза в 3 секунды на одного NPC/бота
+        # FIX: Rate limit по player_guid + hash текста, не только по npc_guid.
         now = time.time()
-        cache_key = str(npc_guid)
-        if cache_key in self._last_talk:
-            if now - self._last_talk[cache_key] < 3.0:
-                cached = self._cache.get(cache_key)
-                if cached:
-                    self._send_response(player_guid, npc_guid, npc_entry, cached, is_player)
-                    return
+        text_hash = self._text_hash(message)
+        cache_key = (player_guid, text_hash)
+        
+        if now - self._last_talk.get(player_guid, 0) < self._cache_ttl:
+            cached = self._cache.get(cache_key)
+            if cached:
+                logger.debug("Cache hit for player %d, hash %s", player_guid, text_hash)
+                self._send_response(player_guid, npc_guid, npc_entry, cached, is_player)
+                return
         
         # Обновить/создать данные NPC/бота в WorldState
         self._ensure_entity_exists(npc_guid, npc_name, npc_entry, is_player)
         
-        # Получить контекст
+        # Получить контекст (теперь ищет по GUID в entities)
         ctx = self.world.get_full_context(str(npc_guid))
         entity_data = ctx.get("npc", {})
         
@@ -120,10 +130,11 @@ class CreatureAIHandler:
         # Записать ответ в БД (Lua прочитает и заставит говорить)
         self._send_response(player_guid, npc_guid, npc_entry, validated, is_player)
         
-        # Кэш
-        cache_key = str(npc_guid)
-        self._last_talk[cache_key] = time.time()
-        self._cache[cache_key] = validated.copy()
+        # FIX: кэш по (player_guid, text_hash)
+        text_hash = self._text_hash(message)
+        cache_key = (player_guid, text_hash)
+        self._last_talk[player_guid] = time.time()
+        self._cache[cache_key] = validated
         
         # Опубликовать событие
         self.bus.publish("entity_talk_ended", {
@@ -144,18 +155,21 @@ class CreatureAIHandler:
         logger.debug("Sending response: player=%d, npc=%d, is_player=%s", 
                     player_guid, npc_guid, is_player)
         
+        # FIX: action_command и mood_change теперь передаются в БД.
+        # Раньше action_command терялся — Lua никогда не видел команду.
         self.db.write_response(
             player_guid=player_guid,
             npc_guid=npc_guid,
             npc_entry=npc_entry,
             response_text=response["speech"],
             emote_id=response.get("emote_id", 0),
-            action_command=response.get("action_command") or response.get("set_flag"),
+            action_command=response.get("action_command"),
             mood_change=response.get("mood_change", "0"),
         )
     
     def _ensure_entity_exists(self, guid: int, name: str, entry: int, is_player: bool):
         """Создать запись в WorldState если нет"""
+        # FIX: пишем в entities.{guid} — туда смотрит get_full_context()
         path = f"entities.{guid}"
         existing = self.world.get_nested(path)
         if not existing:
@@ -175,8 +189,8 @@ class CreatureAIHandler:
                 "last_channel": "SAY",
             }
             self.world.set_nested(path, default_data)
-            logger.debug("Created WorldState for %s %d", 
-                        "bot" if is_player else "NPC", guid)
+            logger.debug("Created WorldState for %s %d (path=%s)",
+                        "bot" if is_player else "NPC", guid, path)
     
     def _update_entity_state(self, guid: int, response: dict, player_message: str, is_player: bool):
         """Обновить состояние после диалога"""
