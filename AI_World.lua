@@ -1,3 +1,9 @@
+if _G.LivingAzerothLoaded then
+    print("[LivingAzeroth] Already loaded! Aborting second load.")
+    return
+end
+_G.LivingAzerothLoaded = true
+
 print("[LivingAzeroth] === FILE LOADING ===")
 
 local AI_WORLD = {
@@ -260,8 +266,32 @@ local function HandleSayChannel(player, msg)
 end
 
 -- ============================================
--- HANDLE PARTY
+-- HANDLE PARTY v2.0 — с фильтрами @роль
 -- ============================================
+
+-- Таблица: ID класса → роль (упрощённо)
+local CLASS_ROLES = {
+    [1]  = "tank",    -- Warrior
+    [2]  = "heal",    -- Paladin (может быть и танком, но упрощаем)
+    [3]  = "dps",     -- Hunter
+    [4]  = "dps",     -- Rogue
+    [5]  = "heal",    -- Priest
+    [6]  = "tank",    -- Death Knight
+    [7]  = "heal",    -- Shaman
+    [8]  = "dps",     -- Mage
+    [9]  = "dps",     -- Warlock
+    [11] = "heal",    -- Druid
+}
+
+local function GetBotRole(bot)
+    --Определяем роль бота по классу--
+    local ok, classId = pcall(function() return bot:GetClass() end)
+    if ok and classId then
+        return CLASS_ROLES[classId] or "dps"
+    end
+    return "dps"
+end
+
 local function HandlePartyChannel(player, msg)
     local group = player:GetGroup()
     if not group then
@@ -275,56 +305,106 @@ local function HandlePartyChannel(player, msg)
         return
     end
 
-    -- DEBUG: сколько членов в группе
-    DebugToPlayer(player, "Group members count: " .. tostring(#members))
+    local lowerMsg = msg:lower()
 
-    local targetBot = nil
-    local targetName = "Unknown"
+    -- ========================================
+    -- ШАГ 1: Проверяем, есть ли фильтр @роль
+    -- ========================================
+    
+    local roleFilter = nil
+    
+    -- Проверяем фильтры @tank, @heal, @dps и т.д.
+    if lowerMsg:find("@tank", 1, true) then
+        roleFilter = "tank"
+    elseif lowerMsg:find("@heal", 1, true) or lowerMsg:find("@хил", 1, true) then
+        roleFilter = "heal"
+    elseif lowerMsg:find("@dps", 1, true) or lowerMsg:find("@дд", 1, true) then
+        roleFilter = "dps"
+    elseif lowerMsg:find("@ranged", 1, true) or lowerMsg:find("@рдд", 1, true) then
+        roleFilter = "ranged"
+    elseif lowerMsg:find("@melee", 1, true) or lowerMsg:find("@мдд", 1, true) then
+        roleFilter = "melee"
+    end
 
+    -- ========================================
+    -- ШАГ 2: Собираем цели
+    -- ========================================
+    
+    local targets = {}  -- список {bot = bot, name = name}
+    
     for i = 1, #members do
         local member = members[i]
         if member then
             local mGuid = member:GetGUIDLow()
             local mName = member:GetName()
-            DebugToPlayer(player, "Member #" .. i .. ": " .. mName .. " (guid=" .. mGuid .. ")")
-
+            
+            -- Пропускаем самого игрока
             if mGuid ~= player:GetGUIDLow() then
-                local lowerMsg = msg:lower()
                 local lowerName = mName:lower()
-                local addressed = (lowerMsg:find(lowerName, 1, true) ~= nil)
-                    or (lowerMsg:find("бро", 1, true) ~= nil)
-                    or (lowerMsg:find("пати", 1, true) ~= nil)
-                    or (lowerMsg:find("все", 1, true) ~= nil)
-                    or (lowerMsg:find("ребята", 1, true) ~= nil)
+                
+                -- Режим 1: Фильтр по роли
+                if roleFilter then
+                    local botRole = GetBotRole(member)
+                    if botRole == roleFilter then
+                        table.insert(targets, {bot = member, name = mName})
+                        DebugToPlayer(player, "FILTER @" .. roleFilter .. " -> " .. mName)
+                    end
+                    
+                -- Режим 2: Обращение по имени или общие слова
+                else
+                    local addressed = (lowerMsg:find(lowerName, 1, true) ~= nil)
+                        or (lowerMsg:find("бро", 1, true) ~= nil)
+                        or (lowerMsg:find("пати", 1, true) ~= nil)
+                        or (lowerMsg:find("все", 1, true) ~= nil)
+                        or (lowerMsg:find("ребята", 1, true) ~= nil)
+                        or (lowerMsg:find("групп", 1, true) ~= nil)
 
-                if addressed then
-                    targetBot = member
-                    targetName = mName
-                    DebugToPlayer(player, "SELECTED bot: " .. mName)
-                    break
+                    if addressed then
+                        table.insert(targets, {bot = member, name = mName})
+                        DebugToPlayer(player, "SELECTED bot: " .. mName)
+                        break  -- В режиме имени берём только первого
+                    end
                 end
             end
         end
     end
 
-    if not targetBot then
-        DebugToPlayer(player, "No bot addressed in party chat")
+    -- ========================================
+    -- ШАГ 3: Отправляем запросы
+    -- ========================================
+    
+    if #targets == 0 then
+        if roleFilter then
+            DebugToPlayer(player, "No bots found for filter: @" .. roleFilter)
+        else
+            DebugToPlayer(player, "No bot addressed in party chat")
+        end
         return
     end
 
-    local botGuid = targetBot:GetGUIDLow()
+    -- Отправляем запрос каждому целевому боту
+    for _, target in ipairs(targets) do
+        local bot = target.bot
+        local botName = target.name
+        local botGuid = bot:GetGUIDLow()
 
-    if WriteRequestToDB(player, targetBot, msg, "PARTY", true) then
-        DebugToPlayer(player, "Party request sent to AI...")
-        local key = GenerateKey(player:GetGUIDLow())
-        pendingChecks[key] = {
-            playerGuid     = player:GetGUIDLow(),
-            playerName     = player:GetName(),
-            targetGuid     = botGuid,
-            targetIsPlayer = true,
-            targetName     = targetName,
-            retries        = 0,
-        }
+        if WriteRequestToDB(player, bot, msg, "PARTY", true) then
+            DebugToPlayer(player, "Party request sent to: " .. botName)
+            local key = GenerateKey(player:GetGUIDLow())
+            pendingChecks[key] = {
+                playerGuid     = player:GetGUIDLow(),
+                playerName     = player:GetName(),
+                targetGuid     = botGuid,
+                targetIsPlayer = true,
+                targetName     = botName,
+                retries        = 0,
+            }
+        end
+    end
+    
+    -- Если было несколько целей (фильтр @роль), покажем summary
+    if #targets > 1 then
+        DebugToPlayer(player, "Sent to " .. #targets .. " bot(s)")
     end
 end
 
@@ -380,28 +460,54 @@ local function HandleWhisperChannel(player, msg, targetNameInput)
 end
 
 -- ============================================
--- MAIN HANDLER
--- ============================================
--- ============================================
--- MAIN HANDLER (DIAGNOSTIC VERSION)
+-- MAIN HANDLER (ДИАГНОСТИКА ВСЕХ ТИПОВ ЧАТА)
 -- ============================================
 local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
-    -- ЛОГ ВСЕГО, что ловит event 18
+    -- ЛОГ ВСЕГО подряд — чтобы увидеть, какой msgType приходит
     Log(string.format("EVENT18: msgType=%d lang=%d target='%s' msg='%s'", 
         msgType, lang, tostring(targetName), msg))
 
     if not msg or #msg < 2 then return end
     if msg:sub(1, 1) == "." then return end
 
-    -- Пока НЕ фильтруем по msgType — обрабатываем ВСЁ как SAY для теста
-    -- чтобы понять, какой msgType приходит для PARTY
+    -- Обрабатываем ВСЕ известные типы, а неизвестные логируем отдельно
+    
+    -- SAY = 1
     if msgType == 1 then
         HandleSayChannel(player, msg)
+        
+    -- PARTY = 10 (стандарт WoW)
     elseif msgType == 10 then
         HandlePartyChannel(player, msg)
+        
+    -- WHISPER = 7 (стандарт WoW)
+    elseif msgType == 7 then
+        HandleWhisperChannel(player, msg, targetName)
+        
+    -- RAID = 11 (стандарт WoW)
+    elseif msgType == 11 then
+        Log("RAID chat detected! msgType=11")
+        HandlePartyChannel(player, msg)  -- Обрабатываем как пати
+        
+    -- GUILD = 9
+    elseif msgType == 9 then
+        Log("GUILD chat detected! msgType=9")
+        
+    -- YELL = 6
+    elseif msgType == 6 then
+        Log("YELL chat detected! msgType=6")
+        
+    -- EMOTE = 3
+    elseif msgType == 3 then
+        Log("EMOTE detected! msgType=3")
+        
+    -- SYSTEM = 2
+    elseif msgType == 2 then
+        Log("SYSTEM msg detected! msgType=2")
+        
+    -- Всё остальное — логируем, чтобы узнать
     else
-        -- ВРЕМЕННО: логируем неизвестные типы, но НЕ обрабатываем
-        Log(string.format("UNHANDLED msgType=%d — add to handler if this is PARTY", msgType))
+        Log(string.format("UNKNOWN msgType=%d — нужно добавить обработчик! msg='%s'", msgType, msg))
     end
 end
 
