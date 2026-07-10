@@ -45,6 +45,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════
+# НОВОЕ (Этап 6): Загрузчик ролевых шаблонов
+# ═══════════════════════════════════════════════════════════════════
+try:
+    from modules.creature_ai.persona_loader import get_persona_loader
+    PERSONA_SYSTEM_AVAILABLE = True
+except ImportError:
+    PERSONA_SYSTEM_AVAILABLE = False
+    logging.warning("PersonaLoader not found, using default responses")
 
 class CreatureAIHandler:
     def __init__(self, world_state: WorldState, llm_queue: PriorityLLMQueue,
@@ -68,6 +77,16 @@ class CreatureAIHandler:
         else:
             self.classifier = None
             logger.warning("TacticalAI classifier NOT loaded")
+        
+        # ═══════════════════════════════════════════════════════════
+        # НОВОЕ (Этап 6): Инициализация системы ролей
+        # ═══════════════════════════════════════════════════════════
+        if PERSONA_SYSTEM_AVAILABLE:
+            self.persona_loader = get_persona_loader()
+            logger.info("Persona system loaded. Active: %s",
+                       self.persona_loader.get_current_persona_name())
+        else:
+            self.persona_loader = None
         
         # Подписаться на события от DB Bridge
         self.db.register_callback(self._on_chat_request)
@@ -144,123 +163,233 @@ class CreatureAIHandler:
         self._handle_chat_dialog(request, message, is_player, channel)
     
     # ═══════════════════════════════════════════════════════════════
-    # НОВЫЙ МЕТОД: Обработка тактической команды (Этап 2)
+    # НОВЫЙ МЕТОД: Обработка тактической команды через LLM (Этап 6)
     # ═══════════════════════════════════════════════════════════════
-    def _handle_tactic_request(self, request: dict, clean_msg: str, 
+    def _handle_tactic_request(self, request: dict, clean_msg: str,
                                 classification: dict) -> None:
         """
-        Обработать тактическую команду от игрока.
+        Обработать тактическую команду.
 
-        Сейчас (Этап 2): бот подтверждает получение команды.
-        Потом (Этап 3): здесь будет вызов планировщика для генерации JSON-плана.
-
-        Аргументы:
-            request: оригинальный запрос из БД
-            clean_msg: очищенное сообщение (без [FILTER])
-            classification: результат классификации
+        Этап 6: Генерируем подтверждение ЧЕРЕЗ LLM с учётом роли персонажа.
+        Быстро (max_tokens=40), но живо и в стиле.
         """
         player_guid = request.get("player_guid", 0)
         npc_guid = request["npc_guid"]
         npc_entry = request.get("npc_entry", 0)
         npc_name = request.get("npc_name", "Bot")
         player_name = request.get("player_name", "Player")
-        
+
         logger.info("TACTIC from %s to %s: '%s'", player_name, npc_name, clean_msg)
-        
-        # Подтверждаем получение команды (кратко, без LLM — быстро)
-        # Это как солдат, который кричит "Есть!" получив приказ
-        ack_responses = [
-            "Принято, жду указаний.",
-            "Понял, выполняю.",
-            "Есть! Приступаю.",
-            "Принял команду.",
-            "Выполняю, капитан.",
-            "Слушаюсь.",
-            "Понял, вперёд!",
-            "Готово к действию.",
-        ]
-        
-        # Выбираем ответ по хэшу сообщения (чтобы одинаковые команды = одинаковые ответы)
-        import random
-        random.seed(self._text_hash(clean_msg))
-        ack = random.choice(ack_responses)
-        
-        response = {
-            "speech": ack,
-            "emote_id": 25,  # point — показывает "я тут, готов"
-            "action_command": "tactic_acknowledged",
-            "mood_change": "0",
-            "set_flag": None,
-        }
-        
-        # Записываем ответ в БД (Lua заставит бота сказать)
-        self._send_response(player_guid, npc_guid, npc_entry, response, True)
-        
-        # Публикуем событие для будущего планировщика
-        self.bus.publish("tactic_command_received", {
-            "player_guid": player_guid,
-            "player_name": player_name,
-            "bot_guid": npc_guid,
-            "bot_name": npc_name,
-            "command": clean_msg,
-            "classification": classification,
-            "timestamp": time.time(),
-        })
-        
-        logger.info("TACTIC acknowledged: %s → %s", player_name, npc_name)
-    
+
+        # Получаем ролевой контекст
+        persona = self._get_bot_persona(npc_guid, npc_name)
+
+        # Формируем системный промпт для быстрого подтверждения
+        system_prompt = self._build_ack_system_prompt(persona, "tactic")
+
+        # Пользовательский промпт — контекст команды
+        user_prompt = f"""Лидер группы ({player_name}) дал тактическую команду: "{clean_msg}"
+
+Твоя задача: КРАТКО подтвердить получение команды (1-2 предложения).
+Отвечай В СТИЛЕ своего персонажа. Можно с эмоциями, сленгом, шутками.
+
+Формат ответа (ТОЛЬКО JSON):
+{{
+  "speech": "текст подтверждения",
+  "emote_id": 0
+}}"""
+
+        # Отправляем в LLM (быстро, priority=1)
+        future = self.llm.submit(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.8,
+            max_tokens=60,
+            priority=1
+        )
+
+        # Обрабатываем асинхронно
+        threading.Thread(
+            target=self._process_tactic_ack,
+            args=(future, player_guid, npc_guid, npc_entry, npc_name,
+                  player_name, clean_msg, classification),
+            daemon=True
+        ).start()
+
     def _handle_mixed_request(self, request: dict, clean_msg: str,
                                classification: dict) -> None:
         """
         Обработать смешанное сообщение (тактика + болтовня).
-        
-        Сейчас: отвечаем как на тактику, но с более живым текстом.
-        Потом: сначала тактика, потом болтовня.
+
+        Этап 6: Тоже через LLM, но с более живым, разговорным стилем.
         """
         player_guid = request.get("player_guid", 0)
         npc_guid = request["npc_guid"]
         npc_entry = request.get("npc_entry", 0)
         npc_name = request.get("npc_name", "Bot")
         player_name = request.get("player_name", "Player")
-        
+
         logger.info("MIXED from %s to %s: '%s'", player_name, npc_name, clean_msg)
-        
-        # Смешанный ответ: подтверждение + немного живости
-        mixed_responses = [
-            f"Го, {player_name}! Разберёмся на месте.",
-            "Понял, шеф. Веди, я за тобой!",
-            "Окей, действуем. Только не веди нас в пропасть, лол.",
-            "Вперёд! Надеюсь, у нас хватит хила, хех.",
-            "Принято! Давно пора показать этим мобам, кто тут главный.",
-        ]
-        
-        import random
-        random.seed(self._text_hash(clean_msg))
-        ack = random.choice(mixed_responses)
-        
-        response = {
-            "speech": ack,
-            "emote_id": 3,  # wave
-            "action_command": "tactic_acknowledged",
-            "mood_change": "+5",  # Немного поднимаем настроение от болтовни
-            "set_flag": None,
+
+        persona = self._get_bot_persona(npc_guid, npc_name)
+        system_prompt = self._build_ack_system_prompt(persona, "mixed")
+
+        user_prompt = f"""Лидер группы ({player_name}) сказал: "{clean_msg}"
+
+Это И тактика, И болтовня. Ответь живо, по-человечески.
+Подтверди команду, но можешь пошутить, поболтать немного.
+
+Формат (ТОЛЬКО JSON):
+{{
+  "speech": "ответ",
+  "emote_id": 0,
+  "mood_change": "0"
+}}"""
+
+        future = self.llm.submit(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.85,
+            max_tokens=80,
+            priority=1
+        )
+
+        threading.Thread(
+            target=self._process_tactic_ack,
+            args=(future, player_guid, npc_guid, npc_entry, npc_name,
+                  player_name, clean_msg, classification),
+            daemon=True
+        ).start()
+
+    # ═══════════════════════════════════════════════════════════════
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (Этап 6)
+    # ═══════════════════════════════════════════════════════════════
+
+    def _get_bot_persona(self, bot_guid: int, bot_name: str) -> dict:
+        """
+        Получить ролевой шаблон для конкретного бота.
+
+        Сначала смотрим WorldState (может быть персональная настройка),
+        потом берём глобальную persona.
+        """
+        # Пробуем получить из WorldState (персональная persona бота)
+        entity = self.world.get_nested(f"entities.{bot_guid}", {})
+        persona_name = entity.get("persona")
+
+        if persona_name and self.persona_loader:
+            return self.persona_loader.get_persona(persona_name)
+
+        # Глобальная persona по умолчанию
+        if self.persona_loader:
+            return self.persona_loader.get_persona()
+
+        # Fallback
+        return {
+            "name": "Default",
+            "system_prompt_addendum": "Ты — игрок-бот в WoW.",
+            "voice_examples": ["Понял.", "Готово."]
         }
-        
-        self._send_response(player_guid, npc_guid, npc_entry, response, True)
-        
-        # Публикуем событие
-        self.bus.publish("tactic_command_received", {
-            "player_guid": player_guid,
-            "player_name": player_name,
-            "bot_guid": npc_guid,
-            "bot_name": npc_name,
-            "command": clean_msg,
-            "classification": classification,
-            "timestamp": time.time(),
-        })
-        
-        logger.info("MIXED acknowledged: %s → %s", player_name, npc_name)
-    
+
+    def _build_ack_system_prompt(self, persona: dict, context: str) -> str:
+        """
+        Собрать системный промпт для подтверждения с учётом persona.
+
+        Аргументы:
+            persona: dict с ролевым шаблоном
+            context: "tactic" или "mixed"
+        """
+        base = f"""Ты — игрок-бот в World of Warcraft (Wrath of the Lich King).
+
+ИМЯ: {persona.get('name', 'Бот')}
+СТИЛЬ: {persona.get('system_prompt_addendum', '')}
+
+ПРАВИЛА:
+1. Отвечай КРАТКО (максимум 2 предложения).
+2. Соблюдай СТИЛЬ персонажа (сленг, лор, сарказм — что указано выше).
+3. Это подтверждение ТАКТИЧЕСКОЙ КОМАНДЫ — не надо длинных речей.
+4. Только JSON формат:
+
+{{
+  "speech": "текст",
+  "emote_id": 0
+}}
+
+ЭМОЦИИ: 0=нет, 1=talk, 3=wave, 14=rude, 18=cry, 25=point"""
+
+        # Добавляем примеры голоса для вдохновения
+        examples = persona.get("voice_examples", [])
+        if examples:
+            base += "\n\nПРИМЕРЫ ТВОЕЙ РЕЧИ:\n"
+            for ex in examples[:3]:
+                base += f'- "{ex}"\n'
+
+        return base
+
+    def _process_tactic_ack(self, future, player_guid, npc_guid, npc_entry,
+                            npc_name, player_name, clean_msg, classification):
+        """
+        Обработать ответ LLM на подтверждение тактики.
+
+        Этот метод работает в отдельном потоке.
+        """
+        try:
+            result = future.result(timeout=10)
+
+            # Парсим JSON из ответа
+            speech = "Понял."  # fallback
+            emote_id = 0
+
+            content = result.get("speech", "") if isinstance(result, dict) else str(result)
+
+            # Пытаемся найти JSON
+            if isinstance(content, str):
+                try:
+                    # Ищем JSON в тексте
+                    start = content.find("{")
+                    end = content.rfind("}")
+                    if start != -1 and end != -1:
+                        data = json.loads(content[start:end+1])
+                        speech = data.get("speech", speech)[:255]  # лимит WoW
+                        emote_id = int(data.get("emote_id", 0))
+                except (json.JSONDecodeError, ValueError):
+                    # Если не JSON — используем текст как есть (обрезанный)
+                    speech = content[:255]
+
+            response = {
+                "speech": speech,
+                "emote_id": emote_id,
+                "action_command": "tactic_acknowledged",
+                "mood_change": "0",
+                "set_flag": None,
+            }
+
+            # Отправляем ответ в игру
+            self._send_response(player_guid, npc_guid, npc_entry, response, True)
+
+            # Публикуем событие для планировщика
+            self.bus.publish("tactic_command_received", {
+                "player_guid": player_guid,
+                "player_name": player_name,
+                "bot_guid": npc_guid,
+                "bot_name": npc_name,
+                "command": clean_msg,
+                "classification": classification,
+                "timestamp": time.time(),
+            })
+
+            logger.info("TACTIC ack from %s: '%s...'", npc_name, speech[:50])
+
+        except Exception as e:
+            logger.error("Tactic ack failed: %s", e)
+            # Fallback: отправляем стандартное подтверждение
+            fallback = {
+                "speech": "Понял, выполняю.",
+                "emote_id": 25,
+                "action_command": "tactic_acknowledged",
+                "mood_change": "0",
+                "set_flag": None,
+            }
+            self._send_response(player_guid, npc_guid, npc_entry, fallback, True)
     # ═══════════════════════════════════════════════════════════════
     # СТАРЫЙ МЕТОД: Обычный диалог (переименован для ясности)
     # ═══════════════════════════════════════════════════════════════

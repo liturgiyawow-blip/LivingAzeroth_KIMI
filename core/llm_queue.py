@@ -100,7 +100,7 @@ class PriorityLLMQueue:
     
     def _execute_task(self, task: dict) -> dict:
         payload = {
-            "model": "local-model",
+            "model": config.LLM_MODEL_NAME,
             "messages": [
                 {"role": "system", "content": task["system_prompt"]},
                 {"role": "user", "content": task["user_prompt"]}
