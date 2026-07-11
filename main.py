@@ -1,8 +1,9 @@
 """
-Living Azeroth — главный файл
+Living Azeroth — главный файл (Вариант А: Живые NPC)
 Запуск: python main.py
 
-Этап 5: Интеграция TacticalAI (планировщик + исполнитель)
+Убрано: TacticalAI (боты, планы, команды)
+Добавлено: NPC профили, квесты, репутация, память
 """
 
 import json
@@ -10,7 +11,6 @@ import logging
 import sys
 from pathlib import Path
 
-# Добавить папку проекта в путь
 sys.path.insert(0, str(Path(__file__).parent))
 
 from flask import Flask, request, jsonify
@@ -22,16 +22,6 @@ from core.event_bus import EventBus
 from core.module_registry import ModuleRegistry
 from wow_connector.db_bridge import WoWDBBridge
 from modules.creature_ai.handlers import CreatureAIHandler
-
-# ═══════════════════════════════════════════════════════════════════
-# НОВОЕ (Этап 3): Импорт TacticalAI
-# ═══════════════════════════════════════════════════════════════════
-try:
-    from modules.tactical_ai import create_tactical_planner, create_plan_executor
-    TACTICAL_AI_AVAILABLE = True
-except ImportError as e:
-    TACTICAL_AI_AVAILABLE = False
-    logging.warning("TacticalAI modules not available: %s", e)
 
 # ─── ЛОГИРОВАНИЕ ───
 logging.basicConfig(
@@ -46,7 +36,7 @@ logger = logging.getLogger("main")
 
 # ─── ИНИЦИАЛИЗАЦИЯ ───
 logger.info("=" * 50)
-logger.info("Living Azeroth starting...")
+logger.info("Living Azeroth [NPC-ONLY] starting...")
 logger.info("=" * 50)
 
 app = Flask(__name__)
@@ -62,33 +52,10 @@ db_bridge = WoWDBBridge()
 # Реестр модулей
 registry = ModuleRegistry(app, world_state, llm_queue, event_bus)
 
-# Модуль Creature AI (NPC + боты)
+# Модуль Creature AI (NPC только)
 creature_handler = CreatureAIHandler(world_state, llm_queue, event_bus, db_bridge)
 registry.register_module("creature_ai", creature_handler)
-
-# ═══════════════════════════════════════════════════════════════════
-# НОВОЕ (Этап 3): Регистрация TacticalAI
-# ═══════════════════════════════════════════════════════════════════
-if TACTICAL_AI_AVAILABLE:
-    logger.info("TacticalAI modules found, initializing...")
-
-    # Планировщик — генерирует планы через LLM
-    tactical_planner = create_tactical_planner(
-        llm_queue, event_bus, db_bridge, world_state
-    )
-    registry.register_module("tactical_planner", tactical_planner)
-    logger.info("TacticalPlanner registered")
-
-    # Исполнитель — читает планы из БД и публикует события
-    tactical_executor = create_plan_executor(
-        db_bridge, event_bus, world_state
-    )
-    tactical_executor.start()
-    registry.register_module("tactical_executor", tactical_executor)
-    logger.info("PlanExecutor started and registered")
-
-else:
-    logger.warning("TacticalAI NOT available — tactic commands will be acknowledged but not executed")
+logger.info("CreatureAIHandler registered (NPC-only mode)")
 
 # Запуск DB Bridge (начать polling MySQL)
 db_bridge.start()
@@ -103,27 +70,14 @@ def health():
     current = llm_queue.get_current_task_info()
     stats = llm_queue.get_stats()
 
-    # ═══════════════════════════════════════════════════════════════
-    # НОВОЕ: Статистика TacticalAI
-    # ═══════════════════════════════════════════════════════════════
-    tactical_stats = {}
-    if TACTICAL_AI_AVAILABLE:
-        try:
-            tactical_stats = {
-                "executor_queue_size": tactical_executor.get_queue_size(),
-                "executor_stats": tactical_executor.get_stats(),
-            }
-        except Exception as e:
-            tactical_stats = {"error": str(e)}
-
     return jsonify({
         "status": "ok",
+        "mode": "npc-only",
         "queue_size": llm_queue.get_queue_size(),
         "current_task": current,
         "stats": stats,
         "world_state_size_mb": round(world_state.get_size_mb(), 2),
         "modules_loaded": list(registry._handlers.keys()),
-        "tactical_ai": tactical_stats,
     })
 
 @app.route("/world/state")
@@ -147,12 +101,42 @@ def force_save():
     })
 
 # ═══════════════════════════════════════════════════════════════════
-# НОВОЕ (Этап 5): Эндпоинты для управления тактикой
+# НОВОЕ: Эндпоинты для NPC-режима
 # ═══════════════════════════════════════════════════════════════════
 
-@app.route("/tactics/plans", methods=["GET"])
-def list_tactic_plans():
-    """Получить список активных тактических планов."""
+@app.route("/npc/<int:npc_guid>/memory")
+def get_npc_memory(npc_guid):
+    """Получить память NPC (все диалоги или с конкретным игроком)."""
+    if request.remote_addr not in config.ALLOWED_HOSTS:
+        return jsonify({"error": "Forbidden"}), 403
+
+    player_guid = request.args.get("player_guid", type=int)
+    limit = request.args.get("limit", 20, type=int)
+
+    memory = db_bridge.get_memory(npc_guid, player_guid, limit)
+    return jsonify({
+        "npc_guid": npc_guid,
+        "player_guid": player_guid,
+        "memory": memory,
+        "count": len(memory),
+    })
+
+@app.route("/npc/<int:npc_guid>/reputation/<int:player_guid>")
+def get_npc_reputation(npc_guid, player_guid):
+    """Получить репутацию игрока у NPC."""
+    if request.remote_addr not in config.ALLOWED_HOSTS:
+        return jsonify({"error": "Forbidden"}), 403
+
+    rep = db_bridge.get_reputation(npc_guid, player_guid)
+    return jsonify({
+        "npc_guid": npc_guid,
+        "player_guid": player_guid,
+        "reputation": rep,
+    })
+
+@app.route("/quests")
+def list_quests():
+    """Список доступных квестов."""
     if request.remote_addr not in config.ALLOWED_HOSTS:
         return jsonify({"error": "Forbidden"}), 403
 
@@ -161,32 +145,33 @@ def list_tactic_plans():
         conn = db_bridge._get_conn()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT plan_id, player_name, encounter_name, status, started_at
-                FROM ai_tactic_plans
-                WHERE status = 'active'
-                ORDER BY started_at DESC
-                LIMIT 20
+                SELECT quest_id, quest_name, giver_npc_entry, giver_npc_name,
+                       required_item_count, reward_gold, reward_reputation
+                FROM npc_quests
+                ORDER BY quest_id
             """)
             rows = cur.fetchall()
-            plans = []
+            quests = []
             for row in rows:
-                plans.append({
-                    "plan_id": row[0],
-                    "player_name": row[1],
-                    "encounter_name": row[2],
-                    "status": row[3],
-                    "started_at": row[4],
+                quests.append({
+                    "quest_id": row[0],
+                    "quest_name": row[1],
+                    "giver_npc_entry": row[2],
+                    "giver_npc_name": row[3],
+                    "required_item_count": row[4],
+                    "reward_gold": row[5],
+                    "reward_reputation": row[6],
                 })
-            return jsonify({"plans": plans, "count": len(plans)})
+            return jsonify({"quests": quests, "count": len(quests)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        if conn:
+        if conn is not None:
             conn.close()
 
-@app.route("/tactics/plan/<plan_id>", methods=["GET"])
-def get_tactic_plan(plan_id):
-    """Получить детали конкретного плана."""
+@app.route("/player/<int:player_guid>/quests")
+def get_player_quests(player_guid):
+    """Получить прогресс квестов игрока."""
     if request.remote_addr not in config.ALLOWED_HOSTS:
         return jsonify({"error": "Forbidden"}), 403
 
@@ -194,71 +179,49 @@ def get_tactic_plan(plan_id):
     try:
         conn = db_bridge._get_conn()
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT plan_id, player_name, plan_json, status, started_at FROM ai_tactic_plans WHERE plan_id = %s",
-                (plan_id,)
-            )
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"error": "Plan not found"}), 404
-
-            plan_data = json.loads(row[2]) if row[2] else {}
-
-            # Получить шаги плана
             cur.execute("""
-                SELECT bot_name, bot_role, phase_name, step_id, action, target, 
-                       strategy_cmd, priority, executed, result_text
-                FROM ai_tactics
-                WHERE plan_id = %s
-                ORDER BY phase_id, step_order
-            """, (plan_id,))
-
-            steps = []
-            for s in cur.fetchall():
-                steps.append({
-                    "bot_name": s[0],
-                    "bot_role": s[1],
-                    "phase": s[2],
-                    "step": s[3],
-                    "action": s[4],
-                    "target": s[5],
-                    "strategy": s[6],
-                    "priority": s[7],
-                    "executed": s[8],
-                    "result": s[9],
+                SELECT pqp.quest_id, nq.quest_name, pqp.status,
+                       pqp.item_count, pqp.npc_kills, pqp.given_at, pqp.completed_at
+                FROM player_quest_progress pqp
+                JOIN npc_quests nq ON pqp.quest_id = nq.quest_id
+                WHERE pqp.player_guid = %s
+                ORDER BY pqp.given_at DESC
+            """, (player_guid,))
+            rows = cur.fetchall()
+            quests = []
+            for row in rows:
+                quests.append({
+                    "quest_id": row[0],
+                    "quest_name": row[1],
+                    "status": row[2],
+                    "item_count": row[3],
+                    "npc_kills": row[4],
+                    "given_at": row[5],
+                    "completed_at": row[6],
                 })
-
-            return jsonify({
-                "plan_id": row[0],
-                "player_name": row[1],
-                "status": row[3],
-                "started_at": row[4],
-                "plan_data": plan_data,
-                "steps": steps,
-            })
+            return jsonify({"player_guid": player_guid, "quests": quests})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        if conn:
+        if conn is not None:
             conn.close()
 
-@app.route("/tactics/cancel/<plan_id>", methods=["POST"])
-def cancel_tactic_plan(plan_id):
-    """Отменить активный план."""
+@app.route("/admin/quest/<quest_id>/give", methods=["POST"])
+def admin_give_quest(quest_id):
+    """Выдать квест игроку (для тестирования)."""
     if request.remote_addr not in config.ALLOWED_HOSTS:
         return jsonify({"error": "Forbidden"}), 403
 
-    if not TACTICAL_AI_AVAILABLE:
-        return jsonify({"error": "TacticalAI not available"}), 503
+    data = request.get_json() or {}
+    player_guid = data.get("player_guid")
+    player_name = data.get("player_name", "Unknown")
+    giver_npc_guid = data.get("giver_npc_guid", 0)
 
-    try:
-        success = tactical_planner.cancel_plan(plan_id)
-        if success:
-            return jsonify({"status": "cancelled", "plan_id": plan_id})
-        else:
-            return jsonify({"error": "Failed to cancel plan"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    if not player_guid:
+        return jsonify({"error": "player_guid required"}), 400
+
+    success = db_bridge.give_quest(player_guid, player_name, quest_id, giver_npc_guid)
+    return jsonify({"success": success, "quest_id": quest_id, "player_guid": player_guid})
 
 
 # ─── ЗАПУСК ───
@@ -266,12 +229,7 @@ if __name__ == "__main__":
     logger.info("Server ready. LM Studio: %s", config.LLM_BASE_URL)
     logger.info("MySQL: %s:%d/%s", config.MYSQL_HOST, config.MYSQL_PORT, config.MYSQL_DB_CHARACTERS)
     logger.info("Modules loaded: %s", list(registry._handlers.keys()))
-
-    if TACTICAL_AI_AVAILABLE:
-        logger.info("TacticalAI: ENABLED (planner + executor)")
-    else:
-        logger.info("TacticalAI: DISABLED")
-
+    logger.info("Mode: NPC-ONLY (dialogs, memory, quests)")
     logger.info("Press Ctrl+C to stop")
 
     try:
@@ -279,16 +237,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
-        # ═══════════════════════════════════════════════════════════
-        # НОВОЕ: Корректное завершение TacticalAI
-        # ═══════════════════════════════════════════════════════════
-        if TACTICAL_AI_AVAILABLE:
-            try:
-                tactical_executor.shutdown()
-                logger.info("PlanExecutor shutdown")
-            except Exception as e:
-                logger.error("Error shutting down executor: %s", e)
-
         db_bridge.shutdown()
         llm_queue.shutdown()
         world_state.shutdown()
