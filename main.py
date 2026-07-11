@@ -5,6 +5,7 @@ Living Azeroth — главный файл
 Этап 5: Интеграция TacticalAI (планировщик + исполнитель)
 """
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -155,6 +156,7 @@ def list_tactic_plans():
     if request.remote_addr not in config.ALLOWED_HOSTS:
         return jsonify({"error": "Forbidden"}), 403
 
+    conn = None
     try:
         conn = db_bridge._get_conn()
         with conn.cursor() as cur:
@@ -179,9 +181,8 @@ def list_tactic_plans():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        if 'conn' in locals():
+        if conn:
             conn.close()
-
 
 @app.route("/tactics/plan/<plan_id>", methods=["GET"])
 def get_tactic_plan(plan_id):
@@ -189,6 +190,7 @@ def get_tactic_plan(plan_id):
     if request.remote_addr not in config.ALLOWED_HOSTS:
         return jsonify({"error": "Forbidden"}), 403
 
+    conn = None
     try:
         conn = db_bridge._get_conn()
         with conn.cursor() as cur:
@@ -237,9 +239,8 @@ def get_tactic_plan(plan_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        if 'conn' in locals():
+        if conn:
             conn.close()
-
 
 @app.route("/tactics/cancel/<plan_id>", methods=["POST"])
 def cancel_tactic_plan(plan_id):

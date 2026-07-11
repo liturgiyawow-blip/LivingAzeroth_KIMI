@@ -427,7 +427,7 @@ local function HandleBotCommandViaSay(player, msg)
             local key = GenerateKey(player:GetGUIDLow())
             pendingChecks[key] = {
                 playerGuid     = player:GetGUIDLow(),
-                playerName     = player:GetGUIDLow(),
+                playerName     = player:GetName(),  -- ← ИСПРАВЛЕНО: теперь имя игрока
                 targetGuid     = botGuid,
                 targetIsPlayer = true,
                 targetName     = botName,
@@ -558,8 +558,16 @@ local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
     elseif msgType == CHAT_WHISPER then
         HandleWhisperChannel(player, msg, targetName)
     elseif msgType == CHAT_PARTY or msgType == CHAT_PARTY_LEADER then
-        Log("PARTY blocked by playerbots C++")
-    else
+        -- FIX: Не блокируем PARTY сообщения от AI_Tactics.lua
+        -- Они идут от лидара и содержат команды для ботов.
+        -- Но блокируем обычный PARTY чат игрока, чтобы не дублировать playerbots.
+        if msg:sub(1, 1) == "@" then
+            Log("PARTY command from player, routing to AI system")
+            -- Обрабатываем как бот-команду через SAY логику
+            HandleBotCommandViaSay(player, msg)
+        else
+            Log("PARTY chat ignored (handled by playerbots C++)")
+        end    else
         Log("msgType=" .. msgType .. " ignored")
     end
 end

@@ -519,24 +519,26 @@ class TacticalPlanner:
     # ═══════════════════════════════════════════════════════════════
 
     def _parse_plan_json(self, raw: dict, original_command: str) -> Optional[dict]:
-        """
-        Извлечь и валидировать JSON-план из ответа LLM.
-
-        LLM может вернуть JSON внутри markdown-блоков или с лишним текстом.
-        Этот метод "вычищает" ответ и проверяет структуру.
-
-        Аргументы:
-            raw: сырой ответ от LLM (dict от _safe_parse_json)
-            original_command: оригинальная команда (для fallback)
-
-        Возвращает:
-            dict с валидным планом или None
-        """
-        # Если LLM вернул ошибку — fallback
         if raw.get("error") or raw.get("fallback"):
             logger.warning("LLM error for plan, using fallback")
             return self._create_fallback_plan(original_command)
 
+        # FIX: _safe_parse_json уже распарсил JSON в dict
+        if isinstance(raw, dict) and "phases" in raw:
+            logger.info("Plan already parsed by LLM queue, using directly")
+            if isinstance(raw.get("phases"), list) and len(raw["phases"]) > 0:
+                for phase in raw["phases"]:
+                    if "steps" not in phase or not isinstance(phase["steps"], list):
+                        logger.warning("Invalid phase structure")
+                        return self._create_fallback_plan(original_command)
+                return raw
+            else:
+                logger.warning("Direct parse has no valid phases")
+                return self._create_fallback_plan(original_command)
+
+        # Fallback: старая логика
+        content = raw.get("speech", "") or str(raw)
+        # ... остальной код без изменений ...
         # Извлекаем текст из ответа
         content = raw.get("speech", "") or str(raw)
 
