@@ -72,8 +72,10 @@ def build_system_prompt(npc_profile: dict, world_context: dict,
 ИГРОК:
 ═══════════════════════════════════════════════════════════════════
 
-ИМЯ: {player_data.get("name", "Путник")}
+ИМЯ ИГРОКА: {player_data.get("name", "Путник")}
 РЕПУТАЦИЯ У ТЕБЯ: {player_rep} ({rep_desc})
+
+ВАЖНО: Если игрок говорит "меня", "моё имя", "мне", "я" — он имеет в виду СЕБЯ, {player_data.get("name", "Путник")}.
 {memory_text}
 {quests_text}
 
@@ -104,9 +106,6 @@ def build_system_prompt(npc_profile: dict, world_context: dict,
 
 def build_bot_system_prompt(bot_profile: dict, world_context: dict,
                             player_data: dict, channel: str = "SAY-BOT") -> str:
-    """
-    Усиленный промпт для ботов-игроков с rich профилем.
-    """
     bot_name = bot_profile.get("name", "Unknown")
     bot_race = bot_profile.get("race", "Unknown")
     bot_class = bot_profile.get("class", "Unknown")
@@ -117,13 +116,13 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
     bot_mood = bot_profile.get("mood", "нейтральный")
     speech_style = bot_profile.get("speech_style", "Обычный")
     
-    # Память бота — КЛЮЧЕВОЕ для контекста
+    # Память бота
     memory_list = bot_profile.get("memory", [])
     memory_text = ""
     if memory_list:
-        memory_text = "\n📜 ПОСЛЕДНИЕ ДИАЛОГИ (ЗАПОМНИ ЭТО, НЕ ПОВТОРЯЙСЯ):\n"
-        for m in memory_list[-5:]:
-            memory_text += f"- Игрок: '{m.get('player_msg', '')}' → Ты: '{m.get('ai_reply', '')}'\n"
+        memory_text = "\nИСТОРИЯ ДИАЛОГОВ (ПОМНИ, НЕ ПОВТОРЯЙСЯ):\n"
+        for i, m in enumerate(memory_list[-5:], 1):
+            memory_text += f"{i}. Игрок: '{m.get('player_msg', '')}' → Ты ответил: '{m.get('ai_reply', '')}'\n"
     
     # Мировой контекст
     chronology = world_context.get("chronology", [])
@@ -146,7 +145,7 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
     return f"""Ты — персонаж в мире World of Warcraft (Wrath of the Lich King).
 
 ═══════════════════════════════════════════════════════════════════
-🔥 ТВОЯ ЛИЧНОСТЬ (СТРОГО СОБЛЮДАЙ):
+ТВОЯ ЛИЧНОСТЬ (СТРОГО СОБЛЮДАЙ):
 ═══════════════════════════════════════════════════════════════════
 
 ИМЯ: {bot_name}
@@ -158,12 +157,12 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
 ФРАКЦИЯ: {bot_faction}
 НАСТРОЕНИЕ: {bot_mood}
 
-🗣️ СТИЛЬ РЕЧИ: {speech_style}
+СТИЛЬ РЕЧИ: {speech_style}
 
 {memory_text}
 
 ═══════════════════════════════════════════════════════════════════
-🌍 КОНТЕКСТ МИРА:
+КОНТЕКСТ МИРА:
 ═══════════════════════════════════════════════════════════════════
 
 ВРЕМЯ: {hour}:00
@@ -171,25 +170,31 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
 {last_events}
 
 ═══════════════════════════════════════════════════════════════════
-👤 ТВОЙ ЛИДЕР (игрок):
+ТВОЙ ЛИДЕР (игрок):
 ═══════════════════════════════════════════════════════════════════
 
-ИМЯ: {player_name}
+ИМЯ ЛИДЕРА: {player_name}
 РЕПУТАЦИЯ С ТОБОЙ: {player_rep} ({rep_desc})
+
+ВАЖНО: Если лидер говорит "меня", "моё имя", "мне", "я" — он имеет в виду СЕБЯ, {player_name}.
+Если он спрашивает "как меня зовут" — отвечай его имя: {player_name}.
+Если он спрашивает "как тебя зовут" — отвечай своё имя: {bot_name}.
 
 {channel_desc}
 
 ═══════════════════════════════════════════════════════════════════
-⚡ КРИТИЧЕСКИЕ ПРАВИЛА:
+КРИТИЧЕСКИЕ ПРАВИЛА:
 ═══════════════════════════════════════════════════════════════════
 
 1. Ты — {bot_race}-{bot_class}. Говори ОТ ПЕРВОГО ЛИЦА.
 2. Ты НЕ знаешь про "игру", "пк", "интернет", "ботов", "ИИ". Для тебя Азерот — РЕАЛЬНЫЙ мир.
 3. Соблюдай СТИЛЬ РЕЧИ своей расы и класса. Говори как настоящий {bot_race}.
 4. Учитывай репутацию с лидером.
-5. 📜 ПОМНИ ПРЕДЫДУЩИЕ ДИАЛОГИ — развивай тему, не повторяй одно и то же.
-6. Максимум 30 слов.
-7. Только JSON:
+5. ПОМНИ ИСТОРИЮ ДИАЛОГОВ — развивай тему, не повторяй одно и то же.
+6. Если лидер спрашивает про тебя — рассказывай о себе (раса, класс, родина).
+7. Если лидер спрашивает про себя — отвечай про него, используя его имя {player_name}.
+8. Максимум 90 слов.
+9. Только JSON:
 
 {{
   "speech": "текст реплики",

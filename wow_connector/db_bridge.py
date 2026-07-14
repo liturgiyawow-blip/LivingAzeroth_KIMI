@@ -1,12 +1,12 @@
 """
 WoWDBBridge — MySQL-based bridge between Python and WoW Eluna
-Replaces file-based polling with direct MySQL queries.
 """
 
 import time
 import threading
 import logging
 from typing import Callable, List, Optional, Dict, Any
+from datetime import datetime
 
 import pymysql
 
@@ -19,6 +19,7 @@ class WoWDBBridge:
     """
     Читает ai_requests из MySQL, отправляет в обработчики,
     пишет ai_responses обратно в MySQL.
+    Управляет npc_memory и npc_reputation.
     """
 
     def __init__(self):
@@ -40,11 +41,9 @@ class WoWDBBridge:
         self._init_last_id()
     
     def _get_conn(self):
-        """Создать новое соединение (thread-safe)."""
         return pymysql.connect(**self._db_config)
     
     def _test_connection(self):
-        """Проверить подключение при старте."""
         try:
             conn = self._get_conn()
             with conn.cursor() as cur:
@@ -56,7 +55,6 @@ class WoWDBBridge:
             raise
 
     def _init_last_id(self):
-        """При старте смотрим MAX(id) в ai_requests."""
         conn = None
         try:
             conn = self._get_conn()
@@ -76,7 +74,6 @@ class WoWDBBridge:
                     pass
 
     def start(self):
-        """Запустить фоновый polling новых запросов."""
         threading.Thread(target=self._poll_loop, daemon=True, name="DBBridgePoller").start()
         logger.info("DB Bridge polling started")
 
@@ -102,7 +99,6 @@ class WoWDBBridge:
             time.sleep(0.5)
     
     def _fetch_new_requests(self) -> List[dict]:
-        """Прочитать новые необработанные запросы из ai_requests."""
         requests = []
         conn = self._get_conn()
         try:
@@ -183,11 +179,10 @@ class WoWDBBridge:
                     pass
     
     # ═══════════════════════════════════════════════════════════════
-    # НОВОЕ: Получение информации о персонаже из characters
+    # CHARACTER INFO
     # ═══════════════════════════════════════════════════════════════
     
     def get_character_info(self, guid: int) -> Optional[dict]:
-        """Получить race/class/level персонажа из таблицы characters."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
@@ -226,6 +221,135 @@ class WoWDBBridge:
                     conn.close()
                 except pymysql.Error:
                     pass
+    
+    # ═══════════════════════════════════════════════════════════════
+    # NPC MEMORY (долгосрочная память)
+    # ═══════════════════════════════════════════════════════════════
+    
+    def save_npc_memory(self, npc_guid: int, npc_entry: int, player_guid: int,
+                        player_name: str, player_message: str, npc_response: str,
+                        mood_after: str = "нейтральный", reputation_after: int = 0) -> bool:
+        """Сохранить запись диалога в npc_memory."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = """
+                    INSERT INTO npc_memory 
+                    (npc_guid, npc_entry, player_guid, player_name, memory_type,
+                     content, player_message, npc_response, mood_after, reputation_after, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, UNIX_TIMESTAMP())
+                """
+                content = f"{player_name}: {player_message} → NPC: {npc_response}"
+                cur.execute(sql, (
+                    npc_guid, npc_entry, player_guid, player_name,
+                    "dialogue", content, player_message, npc_response,
+                    mood_after, reputation_after
+                ))
+                logger.debug("Memory saved for NPC %d, player %d", npc_guid, player_guid)
+                return True
+        except Exception as e:
+            logger.error("Failed to save npc_memory: %s", e)
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    def get_npc_memory(self, npc_guid: int, player_guid: int, limit: int = 10) -> list:
+        """Получить историю диалогов NPC с игроком. Возвращает list[dict] для WorldState."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = """
+                    SELECT player_message, npc_response, mood_after, created_at
+                    FROM npc_memory
+                    WHERE npc_guid = %s AND player_guid = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """
+                cur.execute(sql, (npc_guid, player_guid, limit))
+                rows = cur.fetchall()
+                result = []
+                for row in reversed(rows):
+                    ts = row[3]
+                    time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "unknown"
+                    result.append({
+                        "player_guid": player_guid,
+                        "player_msg": row[0] or "",
+                        "ai_reply": row[1] or "",
+                        "mood": row[2] or "нейтральный",
+                        "timestamp": time_str,
+                    })
+                return result
+        except Exception as e:
+            logger.error("Failed to get npc_memory: %s", e)
+            return []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    def update_npc_reputation(self, npc_guid: int, npc_entry: int, player_guid: int,
+                              player_name: str, reputation_change: int = 0) -> int:
+        """Обновить репутацию игрока у NPC. Возвращает новую репутацию."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT reputation, total_dialogues FROM npc_reputation WHERE npc_guid = %s AND player_guid = %s",
+                    (npc_guid, player_guid)
+                )
+                row = cur.fetchone()
+                
+                if row:
+                    new_rep = row[0] + reputation_change
+                    new_dialogues = row[1] + 1
+                    rank = self._rep_to_rank(new_rep)
+                    cur.execute(
+                        """UPDATE npc_reputation 
+                           SET reputation = %s, total_dialogues = %s, reputation_rank = %s,
+                               last_interaction_at = UNIX_TIMESTAMP(), player_name = %s
+                           WHERE npc_guid = %s AND player_guid = %s""",
+                        (new_rep, new_dialogues, rank, player_name, npc_guid, player_guid)
+                    )
+                else:
+                    new_rep = reputation_change
+                    rank = self._rep_to_rank(new_rep)
+                    cur.execute(
+                        """INSERT INTO npc_reputation 
+                           (npc_guid, npc_entry, player_guid, player_name, reputation,
+                            reputation_rank, total_dialogues, last_interaction_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, UNIX_TIMESTAMP())""",
+                        (npc_guid, npc_entry, player_guid, player_name, new_rep, rank, 1)
+                    )
+                
+                return new_rep
+        except Exception as e:
+            logger.error("Failed to update reputation: %s", e)
+            return 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    @staticmethod
+    def _rep_to_rank(rep: int) -> str:
+        if rep < -50:
+            return "hostile"
+        elif rep < 0:
+            return "unfriendly"
+        elif rep < 50:
+            return "neutral"
+        elif rep < 100:
+            return "friendly"
+        else:
+            return "honored"
     
     def shutdown(self):
         self._running = False

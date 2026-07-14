@@ -4,7 +4,7 @@ if _G.LivingAzerothLoaded then
 end
 _G.LivingAzerothLoaded = true
 
-print("[LivingAzeroth] === FILE LOADING v4.0 ===")
+print("[LivingAzeroth] === FILE LOADING v4.1 ===")
 
 -- ============================================
 -- НАСТРОЙКИ
@@ -12,7 +12,7 @@ print("[LivingAzeroth] === FILE LOADING v4.0 ===")
 local AI_WORLD = {
     SEARCH_RADIUS = 30,
     FIND_RADIUS   = 100,
-    NPC_PREFIX = "№",           -- Префикс для обращения к NPC
+    NPC_PREFIX = "№",
     DEBUG = true,
 }
 
@@ -50,11 +50,8 @@ local function IsRealNPC(creature)
     if not creature then return false end
     local okFlags, npcFlags = pcall(function() return creature:GetNPCFlags() end)
     if okFlags and npcFlags and npcFlags > 0 then return true end
-    local okType, cType = pcall(function() return creature:GetCreatureType() end)
-    local okClass, uClass = pcall(function() return creature:GetClass() end)
-    if okType and cType == CREATURE_TYPE_HUMANOID and okClass and uClass and uClass > 0 then
-        return true
-    end
+    -- FIX: Убрали fallback на Humanoid+Class — это пропускало врагов (кобольды и т.д.)
+    -- Теперь только npcFlags > 0 = реальный NPC (торговцы, квестодатели, стражники)
     return false
 end
 
@@ -88,7 +85,6 @@ local function FindCreatureByGUIDLow(player, guidLow)
             if ok and low == guidLow then return c end
         end
     end
-    -- Fallback: поиск через карту
     local ok, result = pcall(function() return player:GetMap():GetCreature(guidLow) end)
     if ok and result then
         local ok2, low = pcall(function() return result:GetGUIDLow() end)
@@ -132,7 +128,7 @@ local function WriteRequestToDB(player, target, message, channelType, targetIsPl
 end
 
 -- ============================================
--- DELIVER RESPONSE (боты шепчут, NPC говорят в SAY)
+-- DELIVER RESPONSE
 -- ============================================
 local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targetIsPlayer, targetName)
     local player = FindPlayerByGUIDLow(playerGuid)
@@ -170,7 +166,6 @@ local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targe
         if not sayOk then player:SendBroadcastMessage("|cff00ff00[" .. targetName .. "]:|r " .. text) end
         DebugToPlayer(player, "Bot " .. targetName .. " replied via Say")
     else
-        -- Fallback: текст в broadcast
         player:SendBroadcastMessage("|cff00ff00[" .. targetName .. "]:|r " .. text)
     end
 
@@ -207,9 +202,8 @@ local function GlobalPollLoop()
 end
 
 -- ============================================
--- BOT TARGET PARSER (v4.0 — все боты в группе отвечают на SAY)
+-- BOT TARGET PARSER
 -- ============================================
-
 local CLASS_ROLES = {
     [1] = "tank", [2] = "heal", [3] = "dps", [4] = "dps",
     [5] = "heal", [6] = "tank", [7] = "heal", [8] = "dps",
@@ -226,8 +220,6 @@ end
 -- HANDLE SAY — БОТЫ (любой текст в /s = боты слышат)
 -- ============================================
 local function HandleBotSay(player, msg)
-    -- Все сообщения в SAY (кроме NPC-префикса) идут ботам
-    -- Фильтруем: если начинается с № — это NPC, пропускаем
     if msg:sub(1, #AI_WORLD.NPC_PREFIX) == AI_WORLD.NPC_PREFIX then
         return false
     end
@@ -247,7 +239,6 @@ local function HandleBotSay(player, msg)
     for i = 1, #members do
         local member = members[i]
         if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-            -- Проверяем, что это бот (не реальный игрок)
             local ok, isBot = pcall(function() return member:IsBot() end)
             if ok and isBot then
                 table.insert(targets, member)
@@ -287,36 +278,28 @@ end
 -- HANDLE SAY — NPC (№префикс)
 -- ============================================
 local function HandleNPCSay(player, msg)
-    -- Должно начинаться с №
     if msg:sub(1, #AI_WORLD.NPC_PREFIX) ~= AI_WORLD.NPC_PREFIX then
         return false
     end
     
     Log("NPC COMMAND: '" .. msg .. "'")
     
-    -- Убираем префикс №
     local afterPrefix = msg:sub(#AI_WORLD.NPC_PREFIX + 1)
     
-    -- Разделяем: первое слово = имя NPC (опционально), остальное = сообщение
     local npcNameInput = nil
     local msgOnly = afterPrefix
     
-    -- Ищем первое слово (до пробела)
     local firstWord = afterPrefix:match("^(%S+)")
     if firstWord then
-        -- Проверяем: если после первого слова есть ещё текст — это имя NPC + сообщение
         local rest = afterPrefix:sub(#firstWord + 1):gsub("^%s+", "")
         if rest and #rest > 0 then
-            -- Формат: №Имя сообщение
             npcNameInput = firstWord
             msgOnly = rest
         else
-            -- Формат: №сообщение (без имени NPC)
             msgOnly = firstWord
         end
     end
     
-    -- Ищем NPC
     local creatures = player:GetCreaturesInRange(AI_WORLD.SEARCH_RADIUS)
     if not creatures then
         DebugToPlayer(player, "No creatures in range")
@@ -335,11 +318,17 @@ local function HandleNPCSay(player, msg)
             local okAlive = pcall(function() return c:IsAlive() end)
             if okAlive and c:IsAlive() then
                 if IsRealNPC(c) then
+                    -- FIX: Проверяем, не враждебный ли NPC
+                    local okAttack, canAttack = pcall(function() return c:CanStartAttack(player, true) end)
+                    if okAttack and canAttack then
+                        -- Враг, пропускаем
+                        goto continue_npc_loop
+                    end
+                    
                     local okDist, dist = pcall(function() return player:GetDistance(c) end)
                     local okName, cName = pcall(function() return c:GetName() end)
                     
                     if okDist and dist and okName and cName then
-                        -- Если указано имя — ищем по имени
                         if lowerSearchName then
                             if cName:lower():find(lowerSearchName, 1, true) then
                                 if dist < nearestDist then
@@ -349,7 +338,6 @@ local function HandleNPCSay(player, msg)
                                 end
                             end
                         else
-                            -- Без имени — ближайший NPC
                             if dist < nearestDist then
                                 nearestDist = dist
                                 targetNpc = c
@@ -360,6 +348,7 @@ local function HandleNPCSay(player, msg)
                 end
             end
         end
+        ::continue_npc_loop::
     end
     
     if not targetNpc then
@@ -371,7 +360,6 @@ local function HandleNPCSay(player, msg)
         return true
     end
     
-    -- Если сообщение пустое — заглушка
     if not msgOnly or #msgOnly == 0 then
         msgOnly = "привет"
     end
@@ -451,16 +439,13 @@ local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
     if msg:sub(1, 1) == "." then return end
 
     if msgType == CHAT_SAY then
-        -- Сначала проверяем NPC-префикс №
         if HandleNPCSay(player, msg) then
             return
         end
-        -- Иначе — боты слышат всё
         HandleBotSay(player, msg)
     elseif msgType == CHAT_WHISPER then
         HandleWhisperChannel(player, msg, targetName)
     elseif msgType == CHAT_PARTY or msgType == CHAT_PARTY_LEADER then
-        -- PARTY чат — боты playerbots обрабатывают сами
         Log("PARTY chat ignored (handled by playerbots C++)")
     else
         Log("msgType=" .. msgType .. " ignored")
@@ -471,7 +456,7 @@ end
 -- REGISTRATION
 -- ============================================
 RegisterPlayerEvent(18, OnPlayerChat)
-Log("Living Azeroth [v4.0] loaded!")
+Log("Living Azeroth [v4.1] loaded!")
 Log("NPC prefix: '" .. AI_WORLD.NPC_PREFIX .. "'")
 Log("Usage: /s message — bots respond")
 Log("Usage: /s №[NPCName] message — talk to NPC")

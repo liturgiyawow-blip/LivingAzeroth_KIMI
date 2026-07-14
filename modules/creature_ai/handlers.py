@@ -1,7 +1,7 @@
 """
-CreatureAIHandler v4.1 — обработчик диалогов с NPC и ботами
+CreatureAIHandler v4.2 — обработчик диалогов с NPC и ботами
 
-Упрощённая версия: только LLM-диалоги, rich профили ботов.
+Добавлено: долгосрочная память NPC в БД (npc_memory, npc_reputation)
 """
 
 import time
@@ -31,10 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 class CreatureAIHandler:
-    """
-    Главный обработчик диалогов с NPC и ботами.
-    """
-
     def __init__(self, world_state: WorldState, llm_queue: PriorityLLMQueue,
                  event_bus: EventBus, db_bridge: WoWDBBridge):
         self.world = world_state
@@ -48,7 +44,7 @@ class CreatureAIHandler:
         
         self.db.register_callback(self._on_chat_request)
         
-        logger.info("CreatureAIHandler v4.1 initialized")
+        logger.info("CreatureAIHandler v4.2 initialized")
 
     @staticmethod
     def _text_hash(text: str) -> str:
@@ -90,6 +86,15 @@ class CreatureAIHandler:
         
         self._ensure_entity_exists(npc_guid, npc_name, npc_entry, is_player)
         
+        # ═══════════════════════════════════════════════════════════════
+        # НОВОЕ: Загрузить память из БД для NPC
+        # ═══════════════════════════════════════════════════════════════
+        if not is_player:
+            db_memory = self.db.get_npc_memory(npc_guid, player_guid, limit=5)
+            if db_memory:
+                self.world.set_nested(f"entities.{npc_guid}.memory", db_memory)
+                logger.debug("Loaded %d memories from DB for NPC %d", len(db_memory), npc_guid)
+        
         ctx = self.world.get_full_context(str(npc_guid))
         entity_data = ctx.get("npc", {})
         
@@ -109,11 +114,12 @@ class CreatureAIHandler:
         user_prompt = prompts.build_user_prompt(message, channel, is_player)
         
         priority = 1 if channel in ("PARTY", "WHISPER", "SAY-BOT") else 2
+        temp = 0.65 if is_player else 0.75
         
         future = self.llm.submit(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            temperature=0.75,
+            temperature=temp,
             max_tokens=150,
             priority=priority,
         )
@@ -137,6 +143,38 @@ class CreatureAIHandler:
         validated = validators.validate_response(result, "bot" if is_player else "NPC")
         self._update_entity_state(npc_guid, validated, message, is_player, player_guid)
         self._send_response(player_guid, npc_guid, npc_entry, validated, is_player)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # НОВОЕ: Сохранить в долгосрочную память БД
+        # ═══════════════════════════════════════════════════════════════
+        if not is_player:
+            try:
+                mood_val = int(validated.get("mood_change", 0))
+            except (ValueError, TypeError):
+                mood_val = 0
+            
+            current_mood_score = self.world.get_nested(f"entities.{npc_guid}.mood_score", 0)
+            
+            self.db.save_npc_memory(
+                npc_guid=npc_guid,
+                npc_entry=npc_entry,
+                player_guid=player_guid,
+                player_name=player_name,
+                player_message=message,
+                npc_response=validated["speech"],
+                mood_after=str(current_mood_score),
+                reputation_after=current_mood_score
+            )
+            
+            self.db.update_npc_reputation(
+                npc_guid=npc_guid,
+                npc_entry=npc_entry,
+                player_guid=player_guid,
+                player_name=player_name,
+                reputation_change=mood_val
+            )
+            
+            logger.debug("Saved memory and reputation for NPC %d", npc_guid)
         
         text_hash = self._text_hash(message)
         cache_key = (player_guid, text_hash)
@@ -171,12 +209,7 @@ class CreatureAIHandler:
             mood_change=response.get("mood_change", "0"),
         )
     
-    # ═══════════════════════════════════════════════════════════════
-    # RICH ПРОФИЛИ БОТОВ
-    # ═══════════════════════════════════════════════════════════════
-    
     def _ensure_entity_exists(self, guid: int, name: str, entry: int, is_player: bool):
-        """Создать запись в WorldState если нет."""
         path = f"entities.{guid}"
         existing = self.world.get_nested(path)
         if not existing:
@@ -216,7 +249,6 @@ class CreatureAIHandler:
                                name, race, class_name, level)
                     return
             
-            # Fallback для NPC или если character info недоступен
             default_data = {
                 "name": name,
                 "guid": guid,
@@ -297,7 +329,6 @@ class CreatureAIHandler:
 
     def _update_entity_state(self, guid: int, response: dict, player_message: str, 
                              is_player: bool, player_guid: int):
-        """Обновить состояние после диалога."""
         path = f"entities.{guid}"
         
         mood_change = 0
@@ -318,7 +349,6 @@ class CreatureAIHandler:
             mood_text = "нейтральный"
         self.world.set_nested(f"{path}.mood", mood_text)
         
-        # FIX: Добавляем memory с player_guid для контекста
         memory = self.world.get_nested(f"{path}.memory", [])
         memory.append({
             "player_guid": player_guid,
