@@ -1,7 +1,7 @@
 """
-CreatureAIHandler v4.2 — обработчик диалогов с NPC и ботами
+CreatureAIHandler v4.3 — обработчик диалогов с NPC и ботами
 
-Добавлено: долгосрочная память NPC в БД (npc_memory, npc_reputation)
+Добавлено: логирование промптов в отдельный файл для отладки
 """
 
 import time
@@ -10,6 +10,7 @@ import hashlib
 import threading
 import logging
 from typing import Dict, Tuple
+from pathlib import Path
 
 import config
 from core.world_state import WorldState
@@ -29,6 +30,36 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════
+# НОВОЕ: Логгер для промптов (отдельный файл)
+# ═══════════════════════════════════════════════════════════════
+
+def _setup_prompt_logger():
+    """Создать отдельный логгер для промптов."""
+    prompt_logger = logging.getLogger("llm_prompts")
+    prompt_logger.setLevel(logging.DEBUG)
+    
+    # Файл для промптов
+    prompt_file = config.LOGS_DIR / "llm_prompts.log"
+    handler = logging.FileHandler(prompt_file, encoding="utf-8", mode="a")
+    handler.setLevel(logging.DEBUG)
+    
+    # Формат без лишнего мусора
+    formatter = logging.Formatter(
+        "%(asctime)s\n%(message)s\n" + "="*70 + "\n"
+    )
+    handler.setFormatter(formatter)
+    
+    # Убираем дублирование в консоль
+    prompt_logger.propagate = False
+    
+    if not prompt_logger.handlers:
+        prompt_logger.addHandler(handler)
+    
+    return prompt_logger
+
+prompt_logger = _setup_prompt_logger()
+
 
 class CreatureAIHandler:
     def __init__(self, world_state: WorldState, llm_queue: PriorityLLMQueue,
@@ -44,7 +75,7 @@ class CreatureAIHandler:
         
         self.db.register_callback(self._on_chat_request)
         
-        logger.info("CreatureAIHandler v4.2 initialized")
+        logger.info("CreatureAIHandler v4.3 initialized")
 
     @staticmethod
     def _text_hash(text: str) -> str:
@@ -86,9 +117,6 @@ class CreatureAIHandler:
         
         self._ensure_entity_exists(npc_guid, npc_name, npc_entry, is_player)
         
-        # ═══════════════════════════════════════════════════════════════
-        # НОВОЕ: Загрузить память из БД для NPC
-        # ═══════════════════════════════════════════════════════════════
         if not is_player:
             db_memory = self.db.get_npc_memory(npc_guid, player_guid, limit=5)
             if db_memory:
@@ -113,6 +141,17 @@ class CreatureAIHandler:
         
         user_prompt = prompts.build_user_prompt(message, channel, is_player)
         
+        # ═══════════════════════════════════════════════════════════════
+        # НОВОЕ: Логируем промпт перед отправкой в LLM
+        # ═══════════════════════════════════════════════════════════════
+        target_type = "BOT" if is_player else "NPC"
+        prompt_logger.debug(
+            f"[{target_type}] GUID={npc_guid} Name={npc_name} | Player={player_name}\n"
+            f"--- SYSTEM PROMPT ---\n{system_prompt}\n"
+            f"--- USER PROMPT ---\n{user_prompt}\n"
+            f"--- END ---"
+        )
+        
         priority = 1 if channel in ("PARTY", "WHISPER", "SAY-BOT") else 2
         temp = 0.65 if is_player else 0.75
         
@@ -127,12 +166,13 @@ class CreatureAIHandler:
         threading.Thread(
             target=self._process_llm_response,
             args=(future, player_guid, npc_guid, npc_entry, 
-                  player_name, message, is_player, channel),
+                  player_name, message, is_player, channel, system_prompt, user_prompt),
             daemon=True,
         ).start()
     
     def _process_llm_response(self, future, player_guid, npc_guid, 
-                             npc_entry, player_name, message, is_player, channel):
+                             npc_entry, player_name, message, is_player, channel,
+                             system_prompt="", user_prompt=""):
         try:
             result = future.result(timeout=15)
         except Exception as e:
@@ -141,12 +181,25 @@ class CreatureAIHandler:
             result = validators._fallback_response("bot" if is_player else "NPC")
         
         validated = validators.validate_response(result, "bot" if is_player else "NPC")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # НОВОЕ: Логируем ответ LLM
+        # ═══════════════════════════════════════════════════════════════
+        target_type = "BOT" if is_player else "NPC"
+        raw_content = result.get("speech", str(result)) if isinstance(result, dict) else str(result)
+        prompt_logger.debug(
+            f"[{target_type}] GUID={npc_guid} | RESPONSE\n"
+            f"--- RAW LLM OUTPUT ---\n{raw_content[:2000]}\n"
+            f"--- VALIDATED ---\n"
+            f"speech={validated.get('speech', 'N/A')[:200]}\n"
+            f"emote={validated.get('emote_id', 0)}\n"
+            f"mood_change={validated.get('mood_change', '0')}\n"
+            f"--- END ---"
+        )
+        
         self._update_entity_state(npc_guid, validated, message, is_player, player_guid)
         self._send_response(player_guid, npc_guid, npc_entry, validated, is_player)
         
-        # ═══════════════════════════════════════════════════════════════
-        # НОВОЕ: Сохранить в долгосрочную память БД
-        # ═══════════════════════════════════════════════════════════════
         if not is_player:
             try:
                 mood_val = int(validated.get("mood_change", 0))
