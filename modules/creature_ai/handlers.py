@@ -1,10 +1,22 @@
 """
-CreatureAIHandler v4.0 — обработчик диалогов с NPC
+CreatureAIHandler v2.0 — обработчик диалогов с NPC и ботами
+Новое: интегрирован MessageClassifier для разделения тактики и болтовни
 
-Три уровня профилей:
-1. HARDCODED_PROFILES (ручные, крутые)
-2. npc_profiles из базы (сгенерированные ранее)
-3. Умный fallback из игровых данных + ленивая генерация LLM
+Архитектура (три слоя, как у дирижёра):
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Классификатор │ ──► │   LLM-диалог    │     │  Планировщик    │
+│  (что сказали?) │     │  (как ответить) │     │ (что делать?)   │
+│   quick_check   │     │   build_prompt  │     │  (ЭТАП 3)       │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+        │                                              │
+        └──────────────► CHAT ────────────────────────┘
+        │                      (просто болтаем)
+        └──────────────► TACTIC ─────────────────────►
+                               (подтверждаем + ждём план)
+
+Если классификатор говорит TACTIC — бот отвечает кратко "Принято"
+и готовится к получению детального плана (Этап 3).
+Если CHAT — работает старая система диалогов через LLM.
 """
 
 import time
@@ -34,34 +46,54 @@ logger = logging.getLogger(__name__)
 
 
 class CreatureAIHandler:
+    """
+    Главный обработчик диалогов с NPC.
+
+    Как "диспетчер бесед": получает запрос от игрока,
+    собирает контекст (кто NPC, что помнит, какая репутация),
+    отправляет в LLM, получает ответ, записывает в БД для Lua.
+    """
+
     def __init__(self, world_state: WorldState, llm_queue: PriorityLLMQueue,
                  event_bus: EventBus, db_bridge: WoWDBBridge):
         self.world = world_state
         self.llm = llm_queue
         self.bus = event_bus
         self.db = db_bridge
-        self.game_data = GameDataProvider()
-
-        # Кэш
-        self._last_talk: Dict[int, float] = {}
-        self._cache: Dict[Tuple[int, str], dict] = {}
-        self._cache_ttl = 3.0
-
-        # Загрузчик ролей
+        
+        # FIX: кэш по (player_guid, hash_текста), а не только по npc_guid.
+        self._last_talk: Dict[int, float] = {}  # player_guid -> timestamp
+        self._cache: Dict[Tuple[int, str], dict] = {}  # (player_guid, text_hash) -> response
+        self._cache_ttl = 3.0  # секунды
+        
+        # ═══════════════════════════════════════════════════════════
+        # НОВОЕ: Инициализация классификатора (Этап 2)
+        # ═══════════════════════════════════════════════════════════
+        if TACTICAL_AI_AVAILABLE:
+            self.classifier = MessageClassifier(llm_queue)
+            logger.info("TacticalAI classifier loaded")
+        else:
+            self.classifier = None
+            logger.warning("TacticalAI classifier NOT loaded")
+        
+        # ═══════════════════════════════════════════════════════════
+        # НОВОЕ (Этап 6): Инициализация системы ролей
+        # ═══════════════════════════════════════════════════════════
         if PERSONA_SYSTEM_AVAILABLE:
             self.persona_loader = get_persona_loader()
             logger.info("Persona system loaded. Active: %s",
                        self.persona_loader.get_current_persona_name())
         else:
             self.persona_loader = None
-
-        # Подписаться на события
+        
+        # Подписаться на события от DB Bridge
         self.db.register_callback(self._on_chat_request)
-
-        logger.info("CreatureAIHandler v4.0 initialized")
-
+        
+        logger.info("CreatureAIHandler v2.0 initialized")
+    
     @staticmethod
     def _text_hash(text: str) -> str:
+        """FIX: хэш текста сообщения для кэша."""
         return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
 
     # ═══════════════════════════════════════════════════════════════
@@ -69,6 +101,14 @@ class CreatureAIHandler:
     # ═══════════════════════════════════════════════════════════════
 
     def _on_chat_request(self, request: dict):
+        """
+        Вызывается когда DB Bridge находит новый запрос из игры.
+        
+        Теперь с классификацией:
+        1. Определяем тип сообщения (тактика/болтовня)
+        2. Если тактика — быстрое подтверждение (Этап 2)
+        3. Если болтовня — полный LLM-диалог (как раньше)
+        """
         req_id = request.get("id", 0)
         npc_guid = request["npc_guid"]
         npc_entry = request.get("npc_entry", 0)
@@ -78,30 +118,294 @@ class CreatureAIHandler:
         message = request["message"]
         channel = request.get("channel_type", "SAY")
         is_player = request.get("target_is_player", False)
+        
+        logger.info("Incoming: %s '%s' → %s (channel=%s, is_player=%s)",
+                   player_name, message[:50], npc_name, channel, is_player)
+        
+        # ═══════════════════════════════════════════════════════════
+        # НОВОЕ: Классификация сообщения (только для ботов)
+        # ═══════════════════════════════════════════════════════════
+        if is_player and self.classifier and channel in ("SAY-BOT", "WHISPER", "PARTY"):
+            # Убираем префикс [FILTER] из сообщения (добавлен в Lua)
+            clean_msg = message
+            if "] " in message:
+                clean_msg = message.split("] ", 1)[1]
+            
+            # Классифицируем: тактика или болтовня?
+            classification = self.classifier.classify_with_fallback(
+                message=clean_msg,
+                player_name=player_name,
+                channel=channel,
+                bot_count=1
+            )
+            
+            msg_type = classification.get("type", "CHAT")
+            confidence = classification.get("confidence", 0.0)
+            
+            logger.info("Classified '%s' → %s (%.2f): %s",
+                       clean_msg[:40], msg_type, confidence,
+                       classification.get("reason", ""))
+            
+            # Если тактика — обрабатываем по-другому
+            if msg_type == "TACTIC" and confidence >= 0.5:
+                self._handle_tactic_request(request, clean_msg, classification)
+                return
+            # Если MIXED — тоже тактика, но с болтовнёй
+            elif msg_type == "MIXED" and confidence >= 0.5:
+                self._handle_mixed_request(request, clean_msg, classification)
+                return
+            # Иначе CHAT — идём дальше к обычному диалогу
+        
+        # ═══════════════════════════════════════════════════════════
+        # СТАРЫЙ ПУТЬ: обычный диалог (NPC или CHAT-бот)
+        # ═══════════════════════════════════════════════════════════
+        self._handle_chat_dialog(request, message, is_player, channel)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # НОВЫЙ МЕТОД: Обработка тактической команды через LLM (Этап 6)
+    # ═══════════════════════════════════════════════════════════════
+    def _handle_tactic_request(self, request: dict, clean_msg: str,
+                                classification: dict) -> None:
+        """
+        Обработать тактическую команду.
 
-        # Только NPC (не боты)
-        if is_player:
-            logger.debug("Ignoring bot request")
-            return
+        Этап 6: Генерируем подтверждение ЧЕРЕЗ LLM с учётом роли персонажа.
+        Быстро (max_tokens=40), но живо и в стиле.
+        """
+        player_guid = request.get("player_guid", 0)
+        npc_guid = request["npc_guid"]
+        npc_entry = request.get("npc_entry", 0)
+        npc_name = request.get("npc_name", "Bot")
+        player_name = request.get("player_name", "Player")
 
-        logger.info("NPC Dialog: %s '%s' -> %s (entry=%d, guid=%d)",
-                   player_name, message[:50], npc_name, npc_entry, npc_guid)
+        logger.info("TACTIC from %s to %s: '%s'", player_name, npc_name, clean_msg)
 
-        self._handle_npc_dialog(request, message, channel)
+        # Получаем ролевой контекст
+        persona = self._get_bot_persona(npc_guid, npc_name)
+
+        # Формируем системный промпт для быстрого подтверждения
+        system_prompt = self._build_ack_system_prompt(persona, "tactic")
+
+        # Пользовательский промпт — контекст команды
+        user_prompt = f"""Лидер группы ({player_name}) дал тактическую команду: "{clean_msg}"
+
+Твоя задача: КРАТКО подтвердить получение команды (1-2 предложения).
+Отвечай В СТИЛЕ своего персонажа. Можно с эмоциями, сленгом, шутками.
+
+Формат ответа (ТОЛЬКО JSON):
+{{
+  "speech": "текст подтверждения",
+  "emote_id": 0
+}}"""
+
+        # Отправляем в LLM (быстро, priority=1)
+        future = self.llm.submit(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.8,
+            max_tokens=60,
+            priority=1
+        )
+
+        # Обрабатываем асинхронно
+        threading.Thread(
+            target=self._process_tactic_ack,
+            args=(future, player_guid, npc_guid, npc_entry, npc_name,
+                  player_name, clean_msg, classification),
+            daemon=True
+        ).start()
+
+    def _handle_mixed_request(self, request: dict, clean_msg: str,
+                               classification: dict) -> None:
+        """
+        Обработать смешанное сообщение (тактика + болтовня).
+
+        Этап 6: Тоже через LLM, но с более живым, разговорным стилем.
+        """
+        player_guid = request.get("player_guid", 0)
+        npc_guid = request["npc_guid"]
+        npc_entry = request.get("npc_entry", 0)
+        npc_name = request.get("npc_name", "Bot")
+        player_name = request.get("player_name", "Player")
+
+        logger.info("MIXED from %s to %s: '%s'", player_name, npc_name, clean_msg)
+
+        persona = self._get_bot_persona(npc_guid, npc_name)
+        system_prompt = self._build_ack_system_prompt(persona, "mixed")
+
+        user_prompt = f"""Лидер группы ({player_name}) сказал: "{clean_msg}"
+
+Это И тактика, И болтовня. Ответь живо, по-человечески.
+Подтверди команду, но можешь пошутить, поболтать немного.
+
+Формат (ТОЛЬКО JSON):
+{{
+  "speech": "ответ",
+  "emote_id": 0,
+  "mood_change": "0"
+}}"""
+
+        future = self.llm.submit(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.85,
+            max_tokens=80,
+            priority=1
+        )
+
+        threading.Thread(
+            target=self._process_tactic_ack,
+            args=(future, player_guid, npc_guid, npc_entry, npc_name,
+                  player_name, clean_msg, classification),
+            daemon=True
+        ).start()
 
     # ═══════════════════════════════════════════════════════════════
-    # ДИАЛОГ С NPC
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (Этап 6)
     # ═══════════════════════════════════════════════════════════════
 
-    def _handle_npc_dialog(self, request: dict, message: str, channel: str) -> None:
+    def _get_bot_persona(self, bot_guid: int, bot_name: str) -> dict:
+        """
+        Получить ролевой шаблон для конкретного бота.
+
+        Сначала смотрим WorldState (может быть персональная настройка),
+        потом берём глобальную persona.
+        """
+        # Пробуем получить из WorldState (персональная persona бота)
+        entity = self.world.get_nested(f"entities.{bot_guid}", {})
+        persona_name = entity.get("persona")
+
+        if persona_name and self.persona_loader:
+            return self.persona_loader.get_persona(persona_name)
+
+        # Глобальная persona по умолчанию
+        if self.persona_loader:
+            return self.persona_loader.get_persona()
+
+        # Fallback
+        return {
+            "name": "Default",
+            "system_prompt_addendum": "Ты — игрок-бот в WoW.",
+            "voice_examples": ["Понял.", "Готово."]
+        }
+
+    def _build_ack_system_prompt(self, persona: dict, context: str) -> str:
+        """
+        Собрать системный промпт для подтверждения с учётом persona.
+
+        Аргументы:
+            persona: dict с ролевым шаблоном
+            context: "tactic" или "mixed"
+        """
+        base = f"""Ты — игрок-бот в World of Warcraft (Wrath of the Lich King).
+
+ИМЯ: {persona.get('name', 'Бот')}
+СТИЛЬ: {persona.get('system_prompt_addendum', '')}
+
+ПРАВИЛА:
+1. Отвечай КРАТКО (максимум 2 предложения).
+2. Соблюдай СТИЛЬ персонажа (сленг, лор, сарказм — что указано выше).
+3. Это подтверждение ТАКТИЧЕСКОЙ КОМАНДЫ — не надо длинных речей.
+4. Только JSON формат:
+
+{{
+  "speech": "текст",
+  "emote_id": 0
+}}
+
+ЭМОЦИИ: 0=нет, 1=talk, 3=wave, 14=rude, 18=cry, 25=point"""
+
+        # Добавляем примеры голоса для вдохновения
+        examples = persona.get("voice_examples", [])
+        if examples:
+            base += "\n\nПРИМЕРЫ ТВОЕЙ РЕЧИ:\n"
+            for ex in examples[:3]:
+                base += f'- "{ex}"\n'
+
+        return base
+
+    def _process_tactic_ack(self, future, player_guid, npc_guid, npc_entry,
+                            npc_name, player_name, clean_msg, classification):
+        """
+        Обработать ответ LLM на подтверждение тактики.
+
+        Этот метод работает в отдельном потоке.
+        """
+        try:
+            result = future.result(timeout=10)
+
+            # Парсим JSON из ответа
+            speech = "Понял."  # fallback
+            emote_id = 0
+
+            content = result.get("speech", "") if isinstance(result, dict) else str(result)
+
+            # Пытаемся найти JSON
+            if isinstance(content, str):
+                try:
+                    # Ищем JSON в тексте
+                    start = content.find("{")
+                    end = content.rfind("}")
+                    if start != -1 and end != -1:
+                        data = json.loads(content[start:end+1])
+                        speech = data.get("speech", speech)[:255]  # лимит WoW
+                        emote_id = int(data.get("emote_id", 0))
+                except (json.JSONDecodeError, ValueError):
+                    # Если не JSON — используем текст как есть (обрезанный)
+                    speech = content[:255]
+
+            response = {
+                "speech": speech,
+                "emote_id": emote_id,
+                "action_command": "tactic_acknowledged",
+                "mood_change": "0",
+                "set_flag": None,
+            }
+
+            # Отправляем ответ в игру
+            self._send_response(player_guid, npc_guid, npc_entry, response, True)
+
+            # Публикуем событие для планировщика
+            self.bus.publish("tactic_command_received", {
+                "player_guid": player_guid,
+                "player_name": player_name,
+                "bot_guid": npc_guid,
+                "bot_name": npc_name,
+                "command": clean_msg,
+                "classification": classification,
+                "timestamp": time.time(),
+            })
+
+            logger.info("TACTIC ack from %s: '%s...'", npc_name, speech[:50])
+
+        except Exception as e:
+            logger.error("Tactic ack failed: %s", e)
+            # Fallback: отправляем стандартное подтверждение
+            fallback = {
+                "speech": "Понял, выполняю.",
+                "emote_id": 25,
+                "action_command": "tactic_acknowledged",
+                "mood_change": "0",
+                "set_flag": None,
+            }
+            self._send_response(player_guid, npc_guid, npc_entry, fallback, True)
+    # ═══════════════════════════════════════════════════════════════
+    # СТАРЫЙ МЕТОД: Обычный диалог (переименован для ясности)
+    # ═══════════════════════════════════════════════════════════════
+    def _handle_chat_dialog(self, request: dict, message: str, 
+                            is_player: bool, channel: str) -> None:
+        """
+        Обычный диалог с NPC или болтовня с ботом.
+        Это ваша старая логика, работает как раньше.
+        """
         req_id = request.get("id", 0)
         npc_guid = request["npc_guid"]
         npc_entry = request.get("npc_entry", 0)
         npc_name = request.get("npc_name", "Unknown")
         player_name = request["player_name"]
         player_guid = request.get("player_guid", 0)
-
-        # Rate limit
+        
+        # FIX: Rate limit по player_guid + hash текста
         now = time.time()
         text_hash = self._text_hash(message)
         cache_key = (player_guid, text_hash)
@@ -112,28 +416,34 @@ class CreatureAIHandler:
                 logger.debug("Cache hit for player %d", player_guid)
                 self._send_response(player_guid, npc_guid, npc_entry, cached, False)
                 return
-
-        # Обновить/создать данные NPC в WorldState
-        self._ensure_entity_exists(npc_guid, npc_name, npc_entry)
-
-        # Получить профиль NPC (3 уровня)
-        npc_profile = self._get_npc_profile(npc_entry, npc_guid, npc_name)
-
-        # Получить данные игрока
-        player_data = self._get_player_data(player_guid, player_name, npc_guid, npc_entry)
-
-        # Получить контекст мира
+        
+        # Обновить/создать данные NPC/бота в WorldState
+        self._ensure_entity_exists(npc_guid, npc_name, npc_entry, is_player)
+        
+        # Получить контекст
         ctx = self.world.get_full_context(str(npc_guid))
-
-        # Собрать промпт для LLM
-        system_prompt = prompts.build_npc_system_prompt(
-            npc_profile=npc_profile,
-            world_context=ctx,
-            player_data=player_data,
-            channel=channel
-        )
-        user_prompt = prompts.build_npc_user_prompt(message, player_data, npc_profile)
-
+        entity_data = ctx.get("npc", {})
+        
+        # Данные игрока
+        player_data = {
+            "name": player_name,
+            "guid": player_guid,
+            "race": "Unknown",
+            "class": "Unknown",
+            "reputation": entity_data.get("reputation_to_player", 0),
+        }
+        
+        # Выбрать промпт в зависимости от типа
+        if is_player:
+            system_prompt = prompts.build_bot_system_prompt(entity_data, ctx, player_data, channel)
+        else:
+            system_prompt = prompts.build_system_prompt(entity_data, ctx, player_data)
+        
+        user_prompt = prompts.build_user_prompt(message, channel, is_player)
+        
+        # Приоритет: PARTY/WHISPER/SAY-BOT = 1 (микро, быстрый ответ), SAY = 2 (мезо)
+        priority = 1 if channel in ("PARTY", "WHISPER", "SAY-BOT") else 2
+        
         # Отправить в LLM
         future = self.llm.submit(
             system_prompt=system_prompt,
@@ -146,26 +456,25 @@ class CreatureAIHandler:
         # Обработать результат в отдельном потоке
         threading.Thread(
             target=self._process_llm_response,
-            args=(future, req_id, player_guid, npc_guid, npc_entry,
-                  player_name, message, channel, npc_profile),
+            args=(future, req_id, player_guid, npc_guid, npc_entry, 
+                  player_name, message, is_player, channel),
             daemon=True,
         ).start()
-
-    def _process_llm_response(self, future, req_id, player_guid, npc_guid,
-                             npc_entry, player_name, message, channel, npc_profile):
+    
+    def _process_llm_response(self, future, req_id, player_guid, npc_guid, 
+                             npc_entry, player_name, message, is_player, channel):
+        """Обработать ответ LLM (старая логика, без изменений)."""
         try:
             result = future.result(timeout=15)
         except Exception as e:
-            logger.error("LLM request failed for NPC %d: %s", npc_guid, e)
-            result = validators._fallback_response("NPC")
-
-        validated = validators.validate_response(result, "NPC")
-
-        # Обновить состояние
-        self._update_entity_state(npc_guid, validated, message, player_guid, player_name, npc_entry)
-        self._send_response(player_guid, npc_guid, npc_entry, validated, False)
-
-        # Кэш
+            logger.error("LLM request failed for %s (guid=%d): %s", 
+                        "bot" if is_player else "NPC", npc_guid, e)
+            result = validators._fallback_response("bot" if is_player else "NPC")
+        
+        validated = validators.validate_response(result, "bot" if is_player else "NPC")
+        self._update_entity_state(npc_guid, validated, message, is_player)
+        self._send_response(player_guid, npc_guid, npc_entry, validated, is_player)
+        
         text_hash = self._text_hash(message)
         cache_key = (player_guid, text_hash)
         self._last_talk[player_guid] = time.time()
@@ -181,297 +490,16 @@ class CreatureAIHandler:
             "channel": channel,
             "response": validated,
         })
-
-        logger.info("NPC %d (entry=%d) responded: '%s'",
-                   npc_guid, npc_entry, validated["speech"][:50])
-
-        # Если профиль был fallback — запустить ленивую генерацию в фоне
-        if npc_profile.get("generated_by") == "fallback_smart":
-            self._lazy_generate_profile(npc_entry, npc_guid, npc_name)
-
-    # ═══════════════════════════════════════════════════════════════
-    # ТРИ УРОВНЯ ПРОФИЛЕЙ
-    # ═══════════════════════════════════════════════════════════════
-
-    def _get_npc_profile(self, npc_entry: int, npc_guid: int, npc_name: str) -> dict:
-        """
-        Получить профиль NPC по 3 уровням:
-        1. HARDCODED_PROFILES (ручные)
-        2. npc_profiles из базы (сгенерированные)
-        3. Умный fallback из игровых данных
-        """
-        # Уровень 1: Хардкод
-        profile = self._get_hardcoded_profile(npc_entry)
-        if profile:
-            logger.debug("Profile L1 (hardcoded) for entry=%d", npc_entry)
-            return profile
-
-        # Уровень 2: База
-        profile = self.db.get_npc_profile(npc_entry, npc_guid)
-        if profile:
-            logger.debug("Profile L2 (database) for entry=%d, guid=%d", npc_entry, npc_guid)
-            return profile
-
-        # Уровень 3: Умный fallback
-        logger.info("Profile L3 (fallback) for entry=%d, guid=%d — generating smart fallback", npc_entry, npc_guid)
-        profile = self.game_data.build_smart_fallback(npc_entry, npc_guid, npc_name)
-
-        # Сохранить fallback в базу (чтобы не генерировать каждый раз)
-        self.db.save_npc_profile(
-            npc_entry=npc_entry,
-            npc_guid=npc_guid,
-            npc_name=profile["name"],
-            profile=profile,
-            generated_by="fallback"
-        )
-
-        return profile
-
-    def _get_hardcoded_profile(self, npc_entry: int) -> Optional[dict]:
-        """Уровень 1: Ручные профили."""
-        HARDCODED_PROFILES = {
-            1423: {
-                "name": "Штормградский стражник",
-                "role": "Стражник",
-                "trait": "Дисциплинированный, бдительный, немного уставший",
-                "faction": "Альянс",
-                "home_location": "Голдшир, Элвиннский лес",
-                "level": 22,
-                "knowledge": [
-                    "Знает о проблемах с волками в Элвиннском лесу",
-                    "Следит за порядком в Голдшире и на дороге",
-                    "Знает дорогу до Штормграда и Торгового квартала",
-                    "Слышал слухи о бандитах у дороги на Восток",
-                    "Помнит нападение гноллов несколько лет назад",
-                    "Знает таверну =Забитый кабан= как надёжное место",
-                    "Видел, как искатели приключений уходят в шахту к северу",
-                ],
-                "speech_style": "Официальный, краткий, военный. Иногда позволяет себе сарказм после долгой смены.",
-                "mood_default": "нейтральный",
-                "can_give_quests": True,
-                "quests": ["wolves_goldshire"],
-                "gossip_text": "Стойте, путник. Я не со зла, просто выполняю долг.",
-            },
-            68: {
-                "name": "Штормградский стражник",
-                "role": "Стражник",
-                "trait": "Дисциплинированный, бдительный",
-                "faction": "Альянс",
-                "home_location": "Штормград / Элвиннский лес",
-                "knowledge": [
-                    "Знает о проблемах с волками в лесу",
-                    "Следит за порядком",
-                ],
-                "speech_style": "Официальный, краткий, военный",
-                "mood_default": "нейтральный",
-                "can_give_quests": True,
-                "quests": ["wolves_goldshire"],
-            },
-            1756: {
-                "name": "Штормградский стражник",
-                "role": "Стражник",
-                "trait": "Дисциплинированный, бдительный",
-                "faction": "Альянс",
-                "home_location": "Штормград / Элвиннский лес",
-                "knowledge": [
-                    "Знает о проблемах с волками в лесу",
-                    "Следит за порядком",
-                ],
-                "speech_style": "Официальный, краткий, военный",
-                "mood_default": "нейтральный",
-                "can_give_quests": True,
-                "quests": ["wolves_goldshire"],
-            },
-        }
-
-        profile = HARDCODED_PROFILES.get(npc_entry)
-        if profile:
-            profile["generated_by"] = "human"
-        return profile
-
-    # ═══════════════════════════════════════════════════════════════
-    # ЛЕНИВАЯ ГЕНЕРАЦИЯ ПРОФИЛЯ (фоновая, через LLM)
-    # ═══════════════════════════════════════════════════════════════
-
-    def _lazy_generate_profile(self, npc_entry: int, npc_guid: int, npc_name: str):
-        """
-        Фоновая генерация профиля через LLM.
-        Вызывается после первого диалога с fallback-профилем.
-        """
-        logger.info("Lazy profile generation started: entry=%d, guid=%d", npc_entry, npc_guid)
-
-        # Получить fallback-данные для контекста
-        fallback = self.game_data.build_smart_fallback(npc_entry, npc_guid, npc_name)
-
-        # Промпт для LLM
-        system_prompt = """Ты — генератор профилей NPC для World of Warcraft.
-
-Создай яркий, запоминающийся профиль NPC на основе базовых данных.
-Ответь ТОЛЬКО в формате JSON:
-
-{
-  "name": "имя",
-  "role": "роль",
-  "trait": "черты характера",
-  "faction": "фракция",
-  "home_location": "место",
-  "knowledge": ["факт 1", "факт 2", "факт 3", "факт 4", "факт 5"],
-  "speech_style": "стиль речи",
-  "mood_default": "нейтральный",
-  "can_give_quests": false,
-  "quests": [],
-  "gossip_text": "приветственная фраза"
-}
-
-Правила:
-- Знания: 5-7 конкретных фактов о мире (места, события, люди)
-- Стиль речи: опиши как говорит (словарный запас, темп, манера)
-- Имя: если есть имя — используй, иначе придумай подходящее
-- НЕ выдумывай глобальные события, которых нет в лоре WoW WotLK"""
-
-        user_prompt = f"""Создай профиль для NPC:
-
-Имя в базе: {fallback['name']}
-Роль: {fallback['role']}
-Локация: {fallback['home_location']}
-Фракция: {fallback['faction']}
-Тип: {fallback.get('creature_type', 'humanoid')}
-
-Базовые знания:
-{chr(10).join('- ' + k for k in fallback['knowledge'])}
-
-Сгенерируй профиль."""
-
-        # Отправить в LLM с низким приоритетом (фоновая задача)
-        future = self.llm.submit(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=0.8,
-            max_tokens=400,
-            priority=3,  # макро — низкий приоритет
-        )
-
-        # Обработать в фоне
-        def _on_profile_generated(fut, entry, guid):
-            try:
-                result = fut.result(timeout=60)
-                parsed = self._parse_profile_from_llm(result)
-
-                if parsed:
-                    # Сохранить в базу как LLM-сгенерированный
-                    self.db.save_npc_profile(
-                        npc_entry=entry,
-                        npc_guid=guid,
-                        npc_name=parsed.get("name", npc_name),
-                        profile=parsed,
-                        generated_by="llm",
-                        generation_prompt=user_prompt
-                    )
-                    logger.info("Profile generated by LLM: entry=%d, guid=%d", entry, guid)
-                else:
-                    logger.warning("Failed to parse LLM profile for entry=%d", entry)
-
-            except Exception as e:
-                logger.error("Profile generation failed: %s", e)
-
-        threading.Thread(
-            target=_on_profile_generated,
-            args=(future, npc_entry, npc_guid),
-            daemon=True,
-        ).start()
-
-    def _parse_profile_from_llm(self, result: dict) -> Optional[dict]:
-        """Распарсить JSON-профиль из ответа LLM."""
-        if not isinstance(result, dict):
-            return None
-
-        # Если LLM вернул уже dict (llm_queue распарсил)
-        if "role" in result and "knowledge" in result:
-            return result
-
-        # Иначе ищем JSON в тексте
-        text = result.get("speech", "") or str(result)
-        try:
-            # Ищем JSON в тексте
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                data = json.loads(text[start:end+1])
-                if "role" in data and "knowledge" in data:
-                    return data
-        except json.JSONDecodeError:
-            pass
-
-        return None
-
-    # ═══════════════════════════════════════════════════════════════
-    # ДАННЫЕ ИГРОКА
-    # ═══════════════════════════════════════════════════════════════
-
-    def _get_player_data(self, player_guid: int, player_name: str,
-                         npc_guid: int, npc_entry: int) -> dict:
-        rep_data = self.db.get_reputation(npc_guid, player_guid)
-        reputation = rep_data.get("reputation", 0)
-        memory = self.db.get_memory(npc_guid, player_guid, 5)
-
-        active_quests = {}
-        try:
-            conn = self.db._get_ai_conn()
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT pqp.quest_id, nq.quest_name, pqp.status, pqp.item_count
-                    FROM player_quest_progress pqp
-                    JOIN npc_quests nq ON pqp.quest_id = nq.quest_id
-                    WHERE pqp.player_guid = %s AND pqp.status = 'active'
-                """, (player_guid,))
-                for row in cur.fetchall():
-                    active_quests[row[0]] = {
-                        "name": row[1], "status": row[2], "item_count": row[3],
-                    }
-        except Exception as e:
-            logger.error("Failed to get active quests: %s", e)
-        finally:
-            if 'conn' in locals() and conn is not None:
-                conn.close()
-
-        available_quests = []
-        try:
-            conn = self.db._get_ai_conn()
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT quest_id, quest_name FROM npc_quests
-                    WHERE giver_npc_entry = %s
-                """, (npc_entry,))
-                for row in cur.fetchall():
-                    if row[0] not in active_quests:
-                        available_quests.append({"id": row[0], "name": row[1]})
-        except Exception as e:
-            logger.error("Failed to get available quests: %s", e)
-        finally:
-            if 'conn' in locals() and conn is not None:
-                conn.close()
-
-        return {
-            "name": player_name,
-            "guid": player_guid,
-            "reputation": reputation,
-            "reputation_text": self._rep_to_text(reputation),
-            "memory": memory,
-            "active_quests": active_quests,
-            "available_quests": available_quests,
-            "race": "Unknown",
-            "class": "Unknown",
-        }
-
-    # ═══════════════════════════════════════════════════════════════
-    # ОТПРАВКА ОТВЕТА
-    # ═══════════════════════════════════════════════════════════════
-
-    def _send_response(self, player_guid: int, npc_guid: int, npc_entry: int,
+        
+        logger.info("%s %d responded in %s: '%s'", 
+                   "Bot" if is_player else "NPC", npc_guid, channel, validated["speech"][:50])
+    
+    def _send_response(self, player_guid: int, npc_guid: int, npc_entry: int, 
                        response: dict, is_player: bool):
-        logger.debug("Sending response: player=%d, npc=%d, text='%s...'",
-                    player_guid, npc_guid, response["speech"][:30])
-
+        """Записать ответ в ai_responses для Lua."""
+        logger.debug("Sending response: player=%d, npc=%d, is_player=%s", 
+                    player_guid, npc_guid, is_player)
+        
         self.db.write_response(
             player_guid=player_guid,
             npc_guid=npc_guid,
@@ -481,12 +509,9 @@ class CreatureAIHandler:
             action_command=response.get("action_command"),
             mood_change=response.get("mood_change", "0"),
         )
-
-    # ═══════════════════════════════════════════════════════════════
-    # УПРАВЛЕНИЕ СОСТОЯНИЕМ
-    # ═══════════════════════════════════════════════════════════════
-
-    def _ensure_entity_exists(self, guid: int, name: str, entry: int):
+    
+    def _ensure_entity_exists(self, guid: int, name: str, entry: int, is_player: bool):
+        """Создать запись в WorldState если нет."""
         path = f"entities.{guid}"
         existing = self.world.get_nested(path)
         if not existing:
@@ -506,13 +531,13 @@ class CreatureAIHandler:
                 "last_channel": "SAY",
             }
             self.world.set_nested(path, default_data)
-            logger.debug("Created WorldState for NPC %d (entry=%d)", guid, entry)
-
-    def _update_entity_state(self, guid: int, response: dict,
-                             player_message: str, player_guid: int,
-                             player_name: str, npc_entry: int):
+            logger.debug("Created WorldState for %s %d (path=%s)",
+                        "bot" if is_player else "NPC", guid, path)
+    
+    def _update_entity_state(self, guid: int, response: dict, player_message: str, is_player: bool):
+        """Обновить состояние после диалога."""
         path = f"entities.{guid}"
-
+        
         mood_change = 0
         try:
             mood_change = int(response.get("mood_change", 0))
@@ -530,7 +555,7 @@ class CreatureAIHandler:
         else:
             mood_text = "нейтральный"
         self.world.set_nested(f"{path}.mood", mood_text)
-
+        
         memory = self.world.get_nested(f"{path}.memory", [])
         memory.append({
             "player_guid": player_guid,
@@ -541,56 +566,11 @@ class CreatureAIHandler:
         if len(memory) > 10:
             memory = memory[-10:]
         self.world.set_nested(f"{path}.memory", memory)
-
-        self.db.save_memory(
-            npc_guid=guid,
-            npc_entry=npc_entry,
-            player_guid=player_guid,
-            player_name=player_name,
-            memory_type="dialogue",
-            content=f"Player: {player_message[:100]} | NPC: {response.get('speech', '')[:100]}",
-            player_message=player_message[:100],
-            npc_response=response.get("speech", "")[:100],
-            mood_after=mood_text,
-            reputation_after=self.world.get_nested(f"{path}.reputation_to_player", 0),
-        )
-
-        if abs(mood_change) >= 5:
-            self.db.update_reputation(
-                npc_guid=guid,
-                npc_entry=npc_entry,
-                player_guid=player_guid,
-                player_name=player_name,
-                delta=mood_change,
-                dialogue_increment=True
-            )
-        else:
-            self.db.update_reputation(
-                npc_guid=guid,
-                npc_entry=npc_entry,
-                player_guid=player_guid,
-                player_name=player_name,
-                delta=0,
-                dialogue_increment=True
-            )
-
+        
         count = self.world.get_nested(f"{path}.dialogue_count", 0)
         self.world.set_nested(f"{path}.dialogue_count", count + 1)
-
+        
         self.world.append_chronology(
             f"{self.world.get_nested('meta.world_hour', 12)}:00 — "
-            f"NPC {guid} talked with player {player_guid}"
+            f"{'Bot' if is_player else 'NPC'} {guid} talked with player"
         )
-
-    @staticmethod
-    def _rep_to_text(rep: int) -> str:
-        if rep < -50:
-            return "враждебный"
-        elif rep < 0:
-            return "недружелюбный"
-        elif rep < 50:
-            return "нейтральный"
-        elif rep < 100:
-            return "дружелюбный"
-        else:
-            return "почтённый"

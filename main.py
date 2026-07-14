@@ -52,7 +52,7 @@ db_bridge = WoWDBBridge()
 # Реестр модулей
 registry = ModuleRegistry(app, world_state, llm_queue, event_bus)
 
-# Модуль Creature AI (NPC + боты)
+# Модуль Creature AI (NPC только)
 creature_handler = CreatureAIHandler(world_state, llm_queue, event_bus, db_bridge)
 registry.register_module("creature_ai", creature_handler)
 logger.info("CreatureAIHandler registered (NPC + Bots mode)")

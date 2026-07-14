@@ -1,48 +1,107 @@
 """
-Промпты для LLM — NPC и Боты AzerothCore
+Промпты для LLM — NPC AzerothCore (Вариант А: Живые NPC)
+
+Каждый NPC имеет профиль: должность, знания, манера речи.
+LLM должен соблюдать этот профиль строго.
 """
 
 
-def build_system_prompt(npc_data: dict, world_context: dict, player_data: dict) -> str:
-    """Промпт для обычных NPC (SAY)"""
-    npc_name = npc_data.get("name", "Unknown")
-    npc_role = npc_data.get("role", "Житель")
-    npc_trait = npc_data.get("trait", "Обычный")
-    npc_mood = npc_data.get("mood", "нейтральный")
-    npc_faction = npc_data.get("faction", "Нейтральная")
-    
+def build_npc_system_prompt(npc_profile: dict, world_context: dict, 
+                            player_data: dict, channel: str) -> str:
+    """
+    Промпт для NPC с жёстким профилем.
+
+    npc_profile содержит: role, trait, faction, home_location,
+    knowledge (список знаний), speech_style, mood_current.
+    """
+    npc_name = npc_profile.get("name", "Unknown")
+    npc_role = npc_profile.get("role", "Житель")
+    npc_trait = npc_profile.get("trait", "Обычный")
+    npc_faction = npc_profile.get("faction", "Нейтральная")
+    npc_location = npc_profile.get("home_location", "Неизвестно")
+    npc_mood = npc_profile.get("mood_current", "нейтральный")
+
+    # Знания NPC — что он знает о мире
+    knowledge_list = npc_profile.get("knowledge", [])
+    knowledge_text = "\n".join(f"- {k}" for k in knowledge_list) if knowledge_list else "- Ничего особенного"
+
+    # Мировой контекст
     chronology = world_context.get("chronology", [])
     last_events = "\n".join(chronology[-3:]) if chronology else "Нет недавних событий."
-    
+
     weather = world_context.get("world_events", {}).get("weather", "sunny")
     hour = world_context.get("meta", {}).get("world_hour", 12)
-    
+
+    # Данные игрока
     player_rep = player_data.get("reputation", 0)
     rep_desc = _rep_to_text(player_rep)
-    
+    player_memory = player_data.get("memory", [])
+
+    # История диалогов с этим игроком
+    memory_text = ""
+    if player_memory:
+        memory_text = "\nПРЕДЫДУЩИЕ ДИАЛОГИ С ЭТИМ ИГРОКОМ:\n"
+        for m in player_memory[-3:]:
+            memory_text += f"- Игрок: {m.get('player_msg', '')}\n"
+            memory_text += f"  Ты ответил: {m.get('ai_reply', '')}\n"
+
+    # Активные квесты
+    active_quests = player_data.get("active_quests", {})
+    quests_text = ""
+    if active_quests:
+        quests_text = "\nАКТИВНЫЕ КВЕСТЫ ЭТОГО ИГРОКА:\n"
+        for qid, qdata in active_quests.items():
+            status = qdata.get("status", "unknown")
+            quests_text += f"- {qid}: {status}\n"
+
     return f"""Ты — NPC в мире World of Warcraft (Wrath of the Lich King).
+
+═══════════════════════════════════════════════════════════════════
+ТВОЙ ПРОФИЛЬ (строго соблюдай):
+═══════════════════════════════════════════════════════════════════
 
 ИМЯ: {npc_name}
 РОЛЬ: {npc_role}
 ЧЕРТЫ: {npc_trait}
-НАСТРОЕНИЕ: {npc_mood}
 ФРАКЦИЯ: {npc_faction}
+МЕСТО: {npc_location}
+НАСТРОЕНИЕ: {npc_mood}
+
+ЧТО ТЫ ЗНАЕШЬ (говори ТОЛЬКО об этом, не выдумывай):
+{knowledge_text}
+
+СТИЛЬ РЕЧИ: {npc_profile.get("speech_style", "Обычный")}
+
+═══════════════════════════════════════════════════════════════════
+КОНТЕКСТ МИРА:
+═══════════════════════════════════════════════════════════════════
 
 ВРЕМЯ: {hour}:00
 ПОГОДА: {weather}
 
-ИГРОК:
-- Имя: {player_data.get("name", "Путник")}
-- Репутация у твоей фракции: {player_rep} ({rep_desc})
-
 ПОСЛЕДНИЕ СОБЫТИЯ:
 {last_events}
 
+═══════════════════════════════════════════════════════════════════
+ИГРОК:
+═══════════════════════════════════════════════════════════════════
+
+ИМЯ: {player_data.get("name", "Путник")}
+РЕПУТАЦИЯ У ТЕБЯ: {player_rep} ({rep_desc})
+{memory_text}
+{quests_text}
+
+═══════════════════════════════════════════════════════════════════
 ПРАВИЛА:
-1. Отвечай живо, эмоционально, на русском языке.
-2. Учитывай репутацию игрока — если низкая, будь грубым или подозрительным.
-3. Максимум 30 слов.
-4. Только JSON формат:
+═══════════════════════════════════════════════════════════════════
+
+1. Говори ОТ ПЕРВОГО ЛИЦА своего персонажа.
+2. Знай ТОЛЬКО то, что указано в "ЧТО ТЫ ЗНАЕШЬ". Не выдумывай факты.
+3. Учитывай репутацию игрока — если низкая, будь грубым или подозрительным.
+4. Если игрок просит квест — можешь предложить (если can_give_quests=True).
+5. Если игрок приносит предмет для квеста — проверь активные квесты.
+6. Максимум 30 слов.
+7. Только JSON формат:
 
 {{
   "speech": "текст реплики",
@@ -52,83 +111,23 @@ def build_system_prompt(npc_data: dict, world_context: dict, player_data: dict) 
   "action_command": null
 }}
 
-ЭМОЦИИ: 0=нет, 1=talk, 3=wave, 14=rude, 18=cry, 25=point
+ЭМОЦИИ: 0=нет, 1=talk, 3=wave, 14=rude, 18=cry, 25=point, 66=bow, 77=salute
 
 НЕ ПИШИ markdown, только JSON."""
 
 
-def build_bot_system_prompt(bot_data: dict, world_context: dict, 
-                            player_data: dict, channel: str) -> str:
-    """Промпт для ботов-игроков (PARTY/WHISPER) с тактическим контекстом"""
-    bot_name = bot_data.get("name", "Unknown")
-    bot_role = bot_data.get("role", "Боец")
-    bot_trait = bot_data.get("trait", "Агрессивный")
-    bot_mood = bot_data.get("mood", "нейтральный")
-    bot_class = bot_data.get("class", "Warrior")  # TODO: заполнять из game
-    
-    hour = world_context.get("meta", {}).get("world_hour", 12)
-    
-    # Память предыдущих диалогов
-    memory = bot_data.get("memory", [])
-    memory_text = ""
-    if memory:
-        memory_text = "\nПРЕДЫДУЩИЕ ДИАЛОГИ:\n"
-        for m in memory[-3:]:
-            memory_text += f"- Игрок: {m.get('player_msg', '')}\n"
-            memory_text += f"  Ты ответил: {m.get('ai_reply', '')}\n"
-    
-    return f"""Ты — игрок-бот в World of Warcraft (Wrath of the Lich King). Ты НЕ NPC, ты реальный персонаж в пати.
+def build_npc_user_prompt(player_message: str, player_data: dict, 
+                          npc_profile: dict) -> str:
+    """
+    Промпт от игрока с контекстом.
+    """
+    return f"""Игрок {player_data.get('name', 'Путник')} говорит тебе: "{player_message}"
 
-ИМЯ: {bot_name}
-КЛАСС: {bot_class}
-РОЛЬ: {bot_role}
-ЧЕРТЫ: {bot_trait}
-НАСТРОЕНИЕ: {bot_mood}
-
-КАНАЛ: {channel} ({'приватное сообщение' if channel == 'WHISPER' else 'чат группы'})
-
-ЛИДЕР ГРУППЫ: {player_data.get("name", "Лидер")}
-ТВОЯ ЗАДАЧА: помогать лидеру, выполнять команды, вести себя как живой геймер.
-
-{memory_text}
-
-ПРАВИЛА:
-1. Отвечай как живой игрок — сленг, эмоции, сокращения (ок, лол, ща, го).
-2. Если лидер даёт команду — соглашайся и подтверждай действие.
-3. Если непонятно — переспроси или предложи вариант.
-4. Максимум 40 слов.
-5. Только JSON формат:
-
-{{
-  "speech": "текст реплики",
-  "emote_id": 0,
-  "mood_change": "0",
-  "action_command": null,
-  "set_flag": null
-}}
-
-ACTION_COMMAND — если лидер дал тактическую команду, укажи:
-- "follow" — следовать за лидером
-- "stay" — стоять на месте
-- "attack" — атаковать цель
-- "heal" — лечить лидера
-- "buff" — баффнуть группу
-- "loot" — собирать лут
-- null — нет команды
-
-НЕ ПИШИ markdown, только JSON."""
-
-
-def build_user_prompt(player_message: str, channel: str, is_player: bool) -> str:
-    """Промпт от игрока"""
-    prefix = "Лидер группы" if is_player else "Игрок"
-    return f"""{prefix} говорит тебе в {channel}: "{player_message}"
-
-Сгенерируй ответ в формате JSON."""
+Ответь в формате JSON, строго по своему профилю."""
 
 
 def _rep_to_text(rep: int) -> str:
-    """Числовая репутация в текст"""
+    """Числовая репутация в текст."""
     if rep < -50:
         return "враждебный"
     elif rep < 0:

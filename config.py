@@ -1,6 +1,6 @@
 """
-Living Azeroth — конфигурация v2.0
-Две базы: acore_characters (минимально) + livingazeroth_ai (наша)
+Living Azeroth — конфигурация
+Боевая версия, без моков. Реальный LM Studio + Qwen 2.5 14B Q6_0
 """
 
 import os
@@ -27,14 +27,9 @@ LLM_MODEL_NAME = "eva-abliterated-ties-qwen2.5-14b-i1@q6_k"
 MYSQL_HOST = "127.0.0.1"
 MYSQL_PORT = 3306
 MYSQL_USER = os.getenv("MYSQL_USER", "acore")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "acore")
-
-# Игровая база — только для ai_requests / ai_responses
-MYSQL_DB_CHARACTERS = "acore_characters"
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "acore")  # дефолт, если .env не найден
 MYSQL_DB_WORLD = "acore_world"
-
-# ─── MySQL: Наша база (LivingAzeroth AI) ───
-MYSQL_DB_AI = "livingazeroth_ai"
+MYSQL_DB_CHARACTERS = "acore_characters"  # сюда пишем наши таблицы
 
 # ─── TTS — ВЫРЕЗАНО ───
 TTS_ENABLED = False
@@ -51,13 +46,14 @@ LOG_FILE = LOGS_DIR / "living_azeroth.log"
 ALLOWED_HOSTS = {"127.0.0.1", "::1"}
 
 # ─── PRIORITY LLM QUEUE ───
+# 1 = микро (быстрые ответы), 2 = мезо (диалоги), 3 = макро (фон)
 PRIORITY_TOKENS = {
-    1: 120,   # микро (быстрые ответы)
-    2: 80,    # мезо (диалоги)
-    3: 200,   # макро (фон)
+    1: 120,   # Микро: диалоги
+    2: 80,    # Мезо: события
+    3: 200,   # Макро: фон
 }
 
-# ─── NPC FILTER ───
-# NPC если: npcflag > 0 ИЛИ (creaturetype == 7 И unit_class > 0)
-NPC_MIN_NPCFLAG = 1
-NPC_HUMANOID_TYPE = 7
+# ═══════════════════════════════════════════════════════════════════
+# НОВОЕ: Настройка модели LM Studio
+# ═══════════════════════════════════════════════════════════════════
+LLM_MODEL_NAME = "eva-abliterated-ties-qwen2.5-14b-i1@q6_k"  # Имя модели в LM Studio
