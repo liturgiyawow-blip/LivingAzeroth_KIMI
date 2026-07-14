@@ -33,3 +33,5 @@ Thumbs.db
 .vscode/
 *.sublime-project
 *.sublime-workspace
+
+AI_Tactics.lua
