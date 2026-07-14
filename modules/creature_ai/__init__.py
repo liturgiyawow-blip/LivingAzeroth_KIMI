@@ -1,11 +1,8 @@
 """
 CreatureAI — модуль диалогов с NPC и ботами
 
-Вариант А: NPC диалоги + боты через @префикс
-TacticalAI вырезан — планы, классификатор, executor не используются.
+Вариант А: NPC диалоги + боты через SAY канал
 """
 
-# Тактический AI вырезан — не импортируем
+# TacticalAI вырезан — не используется
 TACTICAL_AI_AVAILABLE = False
-PLANNER_AVAILABLE = False
-EXECUTOR_AVAILABLE = False

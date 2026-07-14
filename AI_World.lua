@@ -4,7 +4,7 @@ if _G.LivingAzerothLoaded then
 end
 _G.LivingAzerothLoaded = true
 
-print("[LivingAzeroth] === FILE LOADING v3.2 ===")
+print("[LivingAzeroth] === FILE LOADING v4.0 ===")
 
 -- ============================================
 -- НАСТРОЙКИ
@@ -12,8 +12,7 @@ print("[LivingAzeroth] === FILE LOADING v3.2 ===")
 local AI_WORLD = {
     SEARCH_RADIUS = 30,
     FIND_RADIUS   = 100,
-    BOT_PREFIX = "@",           -- Префикс команд ботам
-    DEFAULT_TARGET = "all",     -- Если не удалось определить адресата — всем
+    NPC_PREFIX = "№",           -- Префикс для обращения к NPC
     DEBUG = true,
 }
 
@@ -208,7 +207,7 @@ local function GlobalPollLoop()
 end
 
 -- ============================================
--- BOT TARGET PARSER (v3.2 — с fallback)
+-- BOT TARGET PARSER (v4.0 — все боты в группе отвечают на SAY)
 -- ============================================
 
 local CLASS_ROLES = {
@@ -223,225 +222,56 @@ local function GetBotRole(bot)
     return "dps"
 end
 
--- Проверяет, является ли слово "общим" (не имя бота, не фильтр)
-local function IsCommonWord(word)
-    local common = {
-        ["что"] = true, ["как"] = true, ["где"] = true, ["когда"] = true,
-        ["почему"] = true, ["зачем"] = true, ["кто"] = true, ["сколько"] = true,
-        ["да"] = true, ["нет"] = true, ["ок"] = true, ["го"] = true,
-        ["привет"] = true, ["пока"] = true, ["спасибо"] = true,
-        ["a"] = true, ["the"] = true, ["is"] = true, ["are"] = true,
-        ["what"] = true, ["how"] = true, ["why"] = true, ["when"] = true,
-        ["yes"] = true, ["no"] = true, ["ok"] = true, ["hi"] = true, ["hello"] = true,
-    }
-    return common[word:lower()] or false
-end
-
-local function ParseBotTargets(player, msg)
-    local commandText = msg:sub(#AI_WORLD.BOT_PREFIX + 1)
-    if not commandText or #commandText == 0 then
-        return nil, "Empty command"
-    end
-    
-    local firstWord = commandText:match("^(%S+)")
-    if not firstWord then return nil, "Empty command" end
-    
-    local lowerFirst = firstWord:lower()
-    local group = player:GetGroup()
-    if not group then return nil, "Not in group" end
-    
-    local members = group:GetMembers()
-    if not members then return nil, "No members" end
-    
-    local targets = {}
-    local filterDesc = ""
-    local isFallback = false  -- Был ли использован fallback на @all
-    
-    -- === РЕЖИМ 1: Явные групповые слова ===
-    if lowerFirst == "all" or lowerFirst == "все" or lowerFirst == "пати" 
-       or lowerFirst == "группа" or lowerFirst == "raid" or lowerFirst == "рейд" 
-       or lowerFirst == "всем" or lowerFirst == "ребята" or lowerFirst == "бро" then
-        
-        filterDesc = "ALL"
-        for i = 1, #members do
-            local member = members[i]
-            if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-                table.insert(targets, member)
-            end
-        end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-        
-    -- === РЕЖИМ 2: Фильтр по роли ===
-    elseif lowerFirst == "tank" or lowerFirst == "танк" or lowerFirst == "танки" then
-        filterDesc = "ROLE:tank"
-        for i = 1, #members do
-            local member = members[i]
-            if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-                if GetBotRole(member) == "tank" then table.insert(targets, member) end
-            end
-        end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-        
-    elseif lowerFirst == "heal" or lowerFirst == "хил" or lowerFirst == "хилы" 
-           or lowerFirst == "лекарь" or lowerFirst == "лекари" then
-        filterDesc = "ROLE:heal"
-        for i = 1, #members do
-            local member = members[i]
-            if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-                if GetBotRole(member) == "heal" then table.insert(targets, member) end
-            end
-        end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-        
-    elseif lowerFirst == "dps" or lowerFirst == "дд" or lowerFirst == "дпс" then
-        filterDesc = "ROLE:dps"
-        for i = 1, #members do
-            local member = members[i]
-            if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-                if GetBotRole(member) == "dps" then table.insert(targets, member) end
-            end
-        end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-        
-    elseif lowerFirst == "ranged" or lowerFirst == "рдд" or lowerFirst == "дальний" then
-        filterDesc = "ROLE:ranged"
-        for i = 1, #members do
-            local member = members[i]
-            if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-                local ok, classId = pcall(function() return member:GetClass() end)
-                if ok and classId and (classId == 3 or classId == 5 or classId == 7 or classId == 8 or classId == 9 or classId == 11) then
-                    table.insert(targets, member)
-                end
-            end
-        end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-        
-    elseif lowerFirst == "melee" or lowerFirst == "мдд" or lowerFirst == "ближний" then
-        filterDesc = "ROLE:melee"
-        for i = 1, #members do
-            local member = members[i]
-            if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-                local ok, classId = pcall(function() return member:GetClass() end)
-                if ok and classId and (classId == 1 or classId == 2 or classId == 4 or classId == 6) then
-                    table.insert(targets, member)
-                end
-            end
-        end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-        
-    -- === РЕЖИМ 3: Фильтр по классу ===
-    elseif lowerFirst == "маг" or lowerFirst == "mage" then
-        filterDesc = "CLASS:mage"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 8 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "жрец" or lowerFirst == "priest" or lowerFirst == "прист" then
-        filterDesc = "CLASS:priest"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 5 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "воин" or lowerFirst == "warrior" then
-        filterDesc = "CLASS:warrior"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 1 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "паладин" or lowerFirst == "paladin" or lowerFirst == "пал" then
-        filterDesc = "CLASS:paladin"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 2 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "охотник" or lowerFirst == "hunter" or lowerFirst == "хант" then
-        filterDesc = "CLASS:hunter"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 3 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "разбойник" or lowerFirst == "rogue" or lowerFirst == "рога" or lowerFirst == "разб" then
-        filterDesc = "CLASS:rogue"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 4 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "дк" or lowerFirst == "deathknight" or lowerFirst == "рыцарь" then
-        filterDesc = "CLASS:deathknight"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 6 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "шаман" or lowerFirst == "shaman" or lowerFirst == "шам" then
-        filterDesc = "CLASS:shaman"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 7 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "чернокнижник" or lowerFirst == "warlock" or lowerFirst == "лок" or lowerFirst == "варлок" then
-        filterDesc = "CLASS:warlock"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 9 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-    elseif lowerFirst == "друид" or lowerFirst == "druid" or lowerFirst == "дру" then
-        filterDesc = "CLASS:druid"
-        for i = 1, #members do local m = members[i]; if m and m:GetGUIDLow() ~= player:GetGUIDLow() then local ok, id = pcall(function() return m:GetClass() end); if ok and id == 11 then table.insert(targets, m) end end end
-        commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-        
-    -- === РЕЖИМ 4: По имени бота (с fallback!) ===
-    else
-        -- Пытаемся найти бота по имени
-        for i = 1, #members do
-            local member = members[i]
-            if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-                local mName = member:GetName():lower()
-                if mName:find(lowerFirst, 1, true) == 1 then
-                    table.insert(targets, member)
-                    break
-                end
-            end
-        end
-        
-        if #targets > 0 then
-            filterDesc = "NAME:" .. firstWord
-            commandText = commandText:sub(#firstWord + 1):gsub("^%s+", "")
-        else
-            -- === FALLBACK: не нашли ни фильтр, ни имя — значит это "поболтать всем" ===
-            -- Пример: "@а что еще скажешь?" → "а" не имя бота, не фильтр
-            -- Значит вся строка после @ — это сообщение для всех ботов
-            filterDesc = "ALL (fallback)"
-            isFallback = true
-            for i = 1, #members do
-                local member = members[i]
-                if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
-                    table.insert(targets, member)
-                end
-            end
-            -- commandText остаётся как есть — вся строка после @
-        end
-    end
-    
-    return targets, filterDesc, commandText, isFallback
-end
-
 -- ============================================
--- HANDLE BOT COMMAND VIA SAY
+-- HANDLE SAY — БОТЫ (любой текст в /s = боты слышат)
 -- ============================================
-local function HandleBotCommandViaSay(player, msg)
-    if msg:sub(1, #AI_WORLD.BOT_PREFIX) ~= AI_WORLD.BOT_PREFIX then
+local function HandleBotSay(player, msg)
+    -- Все сообщения в SAY (кроме NPC-префикса) идут ботам
+    -- Фильтруем: если начинается с № — это NPC, пропускаем
+    if msg:sub(1, #AI_WORLD.NPC_PREFIX) == AI_WORLD.NPC_PREFIX then
         return false
     end
     
-    Log("BOT COMMAND: '" .. msg .. "'")
+    Log("BOT SAY: '" .. msg .. "'")
     
-    local targets, filterDesc, commandText, isFallback = ParseBotTargets(player, msg)
+    local group = player:GetGroup()
+    if not group then
+        DebugToPlayer(player, "No group — bots won't respond")
+        return false
+    end
     
-    if not targets then
-        DebugToPlayer(player, "Bot error: " .. tostring(filterDesc))
-        return true
+    local members = group:GetMembers()
+    if not members then return false end
+    
+    local targets = {}
+    for i = 1, #members do
+        local member = members[i]
+        if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
+            -- Проверяем, что это бот (не реальный игрок)
+            local ok, isBot = pcall(function() return member:IsBot() end)
+            if ok and isBot then
+                table.insert(targets, member)
+            end
+        end
     end
     
     if #targets == 0 then
-        DebugToPlayer(player, "No bots found for: " .. tostring(filterDesc))
-        return true
+        DebugToPlayer(player, "No bots in group")
+        return false
     end
     
-    DebugToPlayer(player, "Target[" .. filterDesc .. "] x" .. #targets .. ": " .. commandText)
+    DebugToPlayer(player, "Broadcast to " .. #targets .. " bot(s): " .. msg)
     
     for _, bot in ipairs(targets) do
         local botName = bot:GetName()
         local botGuid = bot:GetGUIDLow()
-        local fullCommand = "[" .. filterDesc .. "] " .. commandText
         
-        if WriteRequestToDB(player, bot, fullCommand, "SAY-BOT", true) then
+        if WriteRequestToDB(player, bot, msg, "SAY-BOT", true) then
             DebugToPlayer(player, "→ " .. botName)
             local key = GenerateKey(player:GetGUIDLow())
             pendingChecks[key] = {
                 playerGuid     = player:GetGUIDLow(),
-                playerName     = player:GetName(),  -- ← ИСПРАВЛЕНО: теперь имя игрока
+                playerName     = player:GetName(),
                 targetGuid     = botGuid,
                 targetIsPlayer = true,
                 targetName     = botName,
@@ -450,76 +280,120 @@ local function HandleBotCommandViaSay(player, msg)
         end
     end
     
-    DebugToPlayer(player, "Sent to " .. #targets .. " bot(s)")
     return true
 end
 
 -- ============================================
--- HANDLE SAY (сначала боты, потом NPC)
+-- HANDLE SAY — NPC (№префикс)
 -- ============================================
-local function HandleSayChannel(player, msg)
-    if HandleBotCommandViaSay(player, msg) then
-        return
+local function HandleNPCSay(player, msg)
+    -- Должно начинаться с №
+    if msg:sub(1, #AI_WORLD.NPC_PREFIX) ~= AI_WORLD.NPC_PREFIX then
+        return false
     end
     
+    Log("NPC COMMAND: '" .. msg .. "'")
+    
+    -- Убираем префикс №
+    local afterPrefix = msg:sub(#AI_WORLD.NPC_PREFIX + 1)
+    
+    -- Разделяем: первое слово = имя NPC (опционально), остальное = сообщение
+    local npcNameInput = nil
+    local msgOnly = afterPrefix
+    
+    -- Ищем первое слово (до пробела)
+    local firstWord = afterPrefix:match("^(%S+)")
+    if firstWord then
+        -- Проверяем: если после первого слова есть ещё текст — это имя NPC + сообщение
+        local rest = afterPrefix:sub(#firstWord + 1):gsub("^%s+", "")
+        if rest and #rest > 0 then
+            -- Формат: №Имя сообщение
+            npcNameInput = firstWord
+            msgOnly = rest
+        else
+            -- Формат: №сообщение (без имени NPC)
+            msgOnly = firstWord
+        end
+    end
+    
+    -- Ищем NPC
     local creatures = player:GetCreaturesInRange(AI_WORLD.SEARCH_RADIUS)
     if not creatures then
         DebugToPlayer(player, "No creatures in range")
         return true
     end
-
+    
     local targetNpc = nil
     local targetName = "Unknown"
-    local bestMatch = 999
-
-    local lowerInput = npcNameInput:lower()
-
+    local nearestDist = 9999
+    
+    local lowerSearchName = npcNameInput and npcNameInput:lower() or nil
+    
     for i = 1, #creatures do
         local c = creatures[i]
         if c then
             local okAlive = pcall(function() return c:IsAlive() end)
             if okAlive and c:IsAlive() then
-                local okEntry, entry = pcall(function() return c:GetEntry() end)
-                if okEntry and entry and entry > 0 then
-                    if entry < 100000 then
-                        local okDist, dist = pcall(function() return player:GetDistance(c) end)
-                        if okDist and dist and dist < nearestDist then
-                            nearestDist = dist
-                            targetNpc = c
-                            local okName, n = pcall(function() return c:GetName() end)
-                            if okName then targetName = n end
+                if IsRealNPC(c) then
+                    local okDist, dist = pcall(function() return player:GetDistance(c) end)
+                    local okName, cName = pcall(function() return c:GetName() end)
+                    
+                    if okDist and dist and okName and cName then
+                        -- Если указано имя — ищем по имени
+                        if lowerSearchName then
+                            if cName:lower():find(lowerSearchName, 1, true) then
+                                if dist < nearestDist then
+                                    nearestDist = dist
+                                    targetNpc = c
+                                    targetName = cName
+                                end
+                            end
+                        else
+                            -- Без имени — ближайший NPC
+                            if dist < nearestDist then
+                                nearestDist = dist
+                                targetNpc = c
+                                targetName = cName
+                            end
                         end
                     end
                 end
             end
         end
     end
-
+    
     if not targetNpc then
-        DebugToPlayer(player, "No NPC matching '" .. npcNameInput .. "' found")
+        if npcNameInput then
+            DebugToPlayer(player, "No NPC matching '" .. npcNameInput .. "' found")
+        else
+            DebugToPlayer(player, "No NPC in range")
+        end
         return true
     end
-
+    
     -- Если сообщение пустое — заглушка
     if not msgOnly or #msgOnly == 0 then
         msgOnly = "привет"
     end
-
+    
     local npcGuid = targetNpc:GetGUIDLow()
-
-    if WriteRequestToDB(player, targetNpc, msg, "SAY", false) then
-        DebugToPlayer(player, "Talking to NPC: " .. targetName)
+    local npcEntry = 0
+    local okEntry, entryVal = pcall(function() return targetNpc:GetEntry() end)
+    if okEntry then npcEntry = entryVal end
+    
+    if WriteRequestToDB(player, targetNpc, msgOnly, "SAY", false) then
+        DebugToPlayer(player, "Talking to NPC: " .. targetName .. " (entry=" .. npcEntry .. ")")
         local key = GenerateKey(player:GetGUIDLow())
         pendingChecks[key] = {
             playerGuid     = player:GetGUIDLow(),
-            playerName     = player:GetName(),  -- FIX: было GetGUIDLow()
+            playerName     = player:GetName(),
             targetGuid     = npcGuid,
             targetIsPlayer = false,
             targetName     = targetName,
             retries        = 0,
         }
     end
-
+    
     return true
 end
 
@@ -573,24 +447,22 @@ end
 -- ============================================
 local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
     Log(string.format("=== EVENT18 === msgType=%d msg='%s'", msgType, msg))
-    if not msg or #msg < 2 then return end
+    if not msg or #msg < 1 then return end
     if msg:sub(1, 1) == "." then return end
 
     if msgType == CHAT_SAY then
-        HandleSayChannel(player, msg)
+        -- Сначала проверяем NPC-префикс №
+        if HandleNPCSay(player, msg) then
+            return
+        end
+        -- Иначе — боты слышат всё
+        HandleBotSay(player, msg)
     elseif msgType == CHAT_WHISPER then
         HandleWhisperChannel(player, msg, targetName)
     elseif msgType == CHAT_PARTY or msgType == CHAT_PARTY_LEADER then
-        -- FIX: Не блокируем PARTY сообщения от AI_Tactics.lua
-        -- Они идут от лидара и содержат команды для ботов.
-        -- Но блокируем обычный PARTY чат игрока, чтобы не дублировать playerbots.
-        if msg:sub(1, 1) == "@" then
-            Log("PARTY command from player, routing to AI system")
-            -- Обрабатываем как бот-команду через SAY логику
-            HandleBotCommandViaSay(player, msg)
-        else
-            Log("PARTY chat ignored (handled by playerbots C++)")
-        end    else
+        -- PARTY чат — боты playerbots обрабатывают сами
+        Log("PARTY chat ignored (handled by playerbots C++)")
+    else
         Log("msgType=" .. msgType .. " ignored")
     end
 end
@@ -599,10 +471,10 @@ end
 -- REGISTRATION
 -- ============================================
 RegisterPlayerEvent(18, OnPlayerChat)
-Log("Living Azeroth [v3.2] loaded!")
-Log("Prefix: '" .. AI_WORLD.BOT_PREFIX .. "' | Fallback: ON")
-Log("Usage: " .. AI_WORLD.BOT_PREFIX .. "all/tank/heal/dps/маг/Alfonso message")
-Log("Fallback: any @" .. AI_WORLD.BOT_PREFIX .. "unknown → all bots")
+Log("Living Azeroth [v4.0] loaded!")
+Log("NPC prefix: '" .. AI_WORLD.NPC_PREFIX .. "'")
+Log("Usage: /s message — bots respond")
+Log("Usage: /s №[NPCName] message — talk to NPC")
 
 CreateLuaEvent(GlobalPollLoop, 500, 0)
 Log("GlobalPollLoop started (500ms)")

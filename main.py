@@ -1,9 +1,6 @@
 """
-Living Azeroth — главный файл (Вариант А: Живые NPC + Боты)
-Запуск: python main.py
-
-Вариант А: NPC диалоги + боты через @префикс
-Убрано: TacticalAI (plan_executor, tactical_planner — не загружаются)
+Living Azeroth — главный файл
+NPC диалоги + боты через SAY канал
 """
 
 import json
@@ -52,10 +49,10 @@ db_bridge = WoWDBBridge()
 # Реестр модулей
 registry = ModuleRegistry(app, world_state, llm_queue, event_bus)
 
-# Модуль Creature AI (NPC только)
+# Модуль Creature AI (NPC + боты)
 creature_handler = CreatureAIHandler(world_state, llm_queue, event_bus, db_bridge)
 registry.register_module("creature_ai", creature_handler)
-logger.info("CreatureAIHandler registered (NPC + Bots mode)")
+logger.info("CreatureAIHandler registered")
 
 # Запуск DB Bridge (начать polling MySQL)
 db_bridge.start()
@@ -103,10 +100,10 @@ def force_save():
 # ─── ЗАПУСК ───
 if __name__ == "__main__":
     logger.info("Server ready. LM Studio: %s", config.LLM_BASE_URL)
-    logger.info("MySQL: %s:%d (game=%s, ai=%s)", config.MYSQL_HOST, config.MYSQL_PORT,
-                config.MYSQL_DB_CHARACTERS, config.MYSQL_DB_AI)
+    logger.info("MySQL: %s:%d (game=%s)", config.MYSQL_HOST, config.MYSQL_PORT,
+                config.MYSQL_DB_CHARACTERS)
     logger.info("Modules loaded: %s", list(registry._handlers.keys()))
-    logger.info("Mode: NPC + Bots (dialogs, memory, quests)")
+    logger.info("Mode: NPC + Bots (dialogs, memory)")
     logger.info("Press Ctrl+C to stop")
 
     try:

@@ -26,7 +26,6 @@ class WoWDBBridge:
         self._callbacks: List[Callable] = []
         self._last_request_id = 0
         
-        # MySQL connection params from config
         self._db_config = {
             "host": config.MYSQL_HOST,
             "port": config.MYSQL_PORT,
@@ -37,10 +36,7 @@ class WoWDBBridge:
             "autocommit": True,
         }
         
-        # Test connection on init
         self._test_connection()
-        
-        # FIX: не обрабатывать старые запросы после рестарта
         self._init_last_id()
     
     def _get_conn(self):
@@ -54,28 +50,30 @@ class WoWDBBridge:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
             conn.close()
-            logger.info("AI DB connected: %s/%s", config.MYSQL_HOST, config.MYSQL_DB_AI)
-
+            logger.info("AI DB connected: %s/%s", config.MYSQL_HOST, config.MYSQL_DB_CHARACTERS)
         except Exception as e:
             logger.error("MySQL connection failed: %s", e)
             raise
 
     def _init_last_id(self):
-        """
-        FIX: При старте смотрим MAX(id) в ai_requests.
-        Иначе после рестарта сервер обработает все старые необработанные запросы.
-        """
+        """При старте смотрим MAX(id) в ai_requests."""
+        conn = None
         try:
-            conn = self._get_game_conn()
+            conn = self._get_conn()
             with conn.cursor() as cur:
                 cur.execute("SELECT MAX(id) as max_id FROM ai_requests")
                 row = cur.fetchone()
                 self._last_request_id = row[0] or 0
                 logger.info("Last request id set to %d", self._last_request_id)
-            conn.close()
         except Exception as e:
             logger.error("Failed to init last_request_id: %s", e)
             self._last_request_id = 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
 
     def start(self):
         """Запустить фоновый polling новых запросов."""
@@ -101,12 +99,12 @@ class WoWDBBridge:
             except Exception as e:
                 logger.error("Poll loop error: %s", e)
             
-            time.sleep(0.5)  # 500ms между проверками
+            time.sleep(0.5)
     
     def _fetch_new_requests(self) -> List[dict]:
         """Прочитать новые необработанные запросы из ai_requests."""
         requests = []
-        conn = None
+        conn = self._get_conn()
         try:
             with conn.cursor() as cur:
                 sql = """
@@ -136,7 +134,6 @@ class WoWDBBridge:
                         "created_at": created,
                     })
                     
-                    # Обновляем последний обработанный ID
                     if req_id > self._last_request_id:
                         self._last_request_id = req_id
 
@@ -146,16 +143,21 @@ class WoWDBBridge:
                     cur.execute(f"UPDATE ai_requests SET processed = 1 WHERE id IN ({placeholders})", ids)
                     logger.debug("Marked %d requests as processed", len(ids))
 
+        except Exception as e:
+            logger.error("Fetch requests error: %s", e)
         finally:
             if conn is not None:
-                conn.close()
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
 
         return requests
     
     def write_response(self, player_guid: int, npc_guid: int, npc_entry: int,
                        response_text: str, emote_id: int = 0,
                        action_command: str = None, mood_change: str = None):
-        conn = None
+        conn = self._get_conn()
         try:
             with conn.cursor() as cur:
                 sql = """
@@ -174,7 +176,56 @@ class WoWDBBridge:
         except Exception as e:
             logger.error("Failed to write response: %s", e)
         finally:
-            conn.close()
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    # ═══════════════════════════════════════════════════════════════
+    # НОВОЕ: Получение информации о персонаже из characters
+    # ═══════════════════════════════════════════════════════════════
+    
+    def get_character_info(self, guid: int) -> Optional[dict]:
+        """Получить race/class/level персонажа из таблицы characters."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name, race, class, level, gender FROM characters WHERE guid = %s",
+                    (guid,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                
+                race_map = {
+                    1: "Human", 2: "Orc", 3: "Dwarf", 4: "Night Elf",
+                    5: "Undead", 6: "Tauren", 7: "Gnome", 8: "Troll",
+                    10: "Blood Elf", 11: "Draenei"
+                }
+                class_map = {
+                    1: "Warrior", 2: "Paladin", 3: "Hunter", 4: "Rogue",
+                    5: "Priest", 6: "Death Knight", 7: "Shaman", 8: "Mage",
+                    9: "Warlock", 11: "Druid"
+                }
+                
+                return {
+                    "name": row[0],
+                    "race": race_map.get(row[1], "Unknown"),
+                    "class": class_map.get(row[2], "Unknown"),
+                    "level": row[3],
+                    "gender": "Male" if row[4] == 0 else "Female",
+                }
+        except Exception as e:
+            logger.error("Failed to get character info for guid %d: %s", guid, e)
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
     
     def shutdown(self):
         self._running = False
