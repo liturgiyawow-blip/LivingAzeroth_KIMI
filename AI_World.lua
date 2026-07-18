@@ -4,7 +4,7 @@ if _G.LivingAzerothLoaded then
 end
 _G.LivingAzerothLoaded = true
 
-print("[LivingAzeroth] === FILE LOADING v5.0 ===")
+print("[LivingAzeroth] === FILE LOADING v5.2 ===")
 
 -- ============================================
 -- JSON БИБЛИОТЕКА
@@ -12,7 +12,7 @@ print("[LivingAzeroth] === FILE LOADING v5.0 ===")
 local json = require("json")
 
 -- ============================================
--- НАСТРОЙКИ
+-- НАСТРОЙКИ 
 -- ============================================
 local AI_WORLD = {
     SEARCH_RADIUS = 30,
@@ -133,25 +133,31 @@ local function WriteRequestToDB(player, target, message, channelType, targetIsPl
 end
 
 -- ============================================
--- DELIVER RESPONSE
+-- DELIVER RESPONSE (исправлено — убран шумный лог)
 -- ============================================
 local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targetIsPlayer, targetName)
     local player = FindPlayerByGUIDLow(playerGuid)
     if not player then
-        Log("Player offline: " .. tostring(playerName))
+        -- Игрок вышел из игры — удаляем из очереди
         return true
     end
+    
     local sql = string.format(
         "SELECT id, response_text, emote_id, action_command FROM ai_responses " ..
         "WHERE player_guid = %u AND npc_guid = %u AND fetched = 0 ORDER BY created_at DESC LIMIT 1",
         playerGuid, targetGuid
     )
     local query = CharDBQuery(sql)
-    if not query then return false end
+    if not query then
+        -- Нет ответа ещё — нормально, ждём
+        return false
+    end
+    
     local rowId     = query:GetUInt32(0)
     local text      = query:GetString(1)
     local emoteId   = query:GetUInt32(2)
     local actionCmd = query:GetString(3)
+    
     CharDBExecute("UPDATE ai_responses SET fetched = 1, delivered_at = UNIX_TIMESTAMP() WHERE id = " .. rowId)
 
     local target = nil
@@ -171,12 +177,15 @@ local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targe
         if not sayOk then player:SendBroadcastMessage("|cff00ff00[" .. targetName .. "]:|r " .. text) end
         DebugToPlayer(player, "Bot " .. targetName .. " replied via Say")
     else
+        -- Бот/НПЦ не в мире — отправляем через broadcast
         player:SendBroadcastMessage("|cff00ff00[" .. targetName .. "]:|r " .. text)
     end
 
     if actionCmd and actionCmd ~= "" and actionCmd ~= "null" then
         Log("Action command: " .. actionCmd)
     end
+    
+    Log(string.format("DELIVERED: %s -> %s: '%s'", targetName, playerName, text:sub(1, 50)))
     return true
 end
 
@@ -492,17 +501,17 @@ local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
 end
 
 -- ============================================
--- COMBAT ANALYST MODULE v1.0 — РП-версия
+-- COMBAT ANALYST MODULE v5.2 — РП-версия
 -- ============================================
 
 local COMBAT_CONFIG = {
-    -- Шанс базовый (живой игрок говорит после боя)
-    BASE_CHANCE_PLAYER = 0,
-    
     -- Шанс базовый (бот комментирует после боя)
-    BASE_CHANCE_BOT = 15,
+    BASE_CHANCE_BOT = 35,
     
     -- Модификаторы тяжести (складываются к BASE_CHANCE_BOT)
+    -- Чтобы добавить новый модификатор:
+    -- 1. Добавь значение здесь
+    -- 2. Добавь проверку в OnLeaveCombat (см. примеры ниже)
     MOD_EASY_FIGHT = 0,
     MOD_WOUNDED = 15,
     MOD_CRITICALLY_WOUNDED = 30,
@@ -510,13 +519,11 @@ local COMBAT_CONFIG = {
     MOD_BOSS_KILL = 20,
     MOD_LONG_FIGHT = 10,
     MOD_SOLO_SURVIVOR = 60,
+    -- ПРИМЕР добавления нового модификатора:
+    -- MOD_SOLO_HEALER = 45,  -- Остался один хил живым
     
     -- Максимальный шанс
     MAX_CHANCE = 85,
-    
-    -- Задержка перед фразой (секунды)
-    --DELAY_MIN = 0,
-    --DELAY_MAX = 1,
 }
 
 -- Хранилище боёв: [leader_guid] = session_data
@@ -560,20 +567,20 @@ end
 -- ============================================
 -- COMBAT EVENT HANDLERS
 -- ============================================
-
--- Игрок вошёл в бой
 -- Игрок вошёл в бой
 local function OnEnterCombat(event, player, enemy)
-    -- FIX v5.1: Только живой игрок триггерит CombatAnalyst
-    -- Боты в группе уже учтены как участники
+    -- FIX v5.2: Только живой игрок триггерит CombatAnalyst
+    -- Боты молча игнорируются — без лога, без спама
     local okIsBot, isBot = pcall(function() return player:IsBot() end)
     if okIsBot and isBot then
-        return  -- Игнорируем combat ботов
+        return
     end
     
     local guid = player:GetGUIDLow()
     local group = player:GetGroup()
-    if not group then return end
+    if not group then
+        return
+    end
     
     -- Собираем ТОЛЬКО ботов в группе
     local members = group:GetMembers()
@@ -594,7 +601,14 @@ local function OnEnterCombat(event, player, enemy)
         end
     end
     
-    if #participants == 0 then return end
+    if #participants == 0 then
+        return
+    end
+    
+    -- Если уже есть активная сессия для этого лидера — перезаписываем
+    if combatSessions[guid] then
+        Log("Combat session restarted for " .. player:GetName())
+    end
     
     combatSessions[guid] = {
         active = true,
@@ -628,10 +642,26 @@ local function OnKillCreature(event, player, killed)
 end
 
 -- Игрок вышел из боя
+-- ============================================
+-- COMBAT EVENT HANDLERS (исправлено — убран спам)
+-- ============================================
+
+-- Игрок вышел из боя
 local function OnLeaveCombat(event, player)
+    -- FIX v5.2: Игнорируем ботов — только живой игрок владеет сессией
+    local okIsBot, isBot = pcall(function() return player:IsBot() end)
+    if okIsBot and isBot then
+        return  -- Молча игнорируем, без лога
+    end
+    
     local guid = player:GetGUIDLow()
     local session = combatSessions[guid]
-    if not session or not session.active then return end
+    
+    if not session or not session.active then
+        -- Нет активной сессии — значит бой был без ботов или уже обработан
+        -- Молча выходим, без спам-лога
+        return
+    end
     
     session.active = false
     session.end_time = os.time()
@@ -709,6 +739,24 @@ local function OnLeaveCombat(event, player)
         table.insert(modifiers, "единственный выживший")
     end
     
+    -- ═══════════════════════════════════════════════════════════════
+    -- ПРИМЕР: Добавить новый модификатор "Остался один хил"
+    -- Раскомментируй и адаптируй:
+    -- ═══════════════════════════════════════════════════════════════
+    -- local healersAlive = 0
+    -- local lastHealer = nil
+    -- for _, p in ipairs(session.participants) do
+    --     if p.deaths == 0 and (p.class == "Priest" or p.class == "Shaman" 
+    --         or p.class == "Paladin" or p.class == "Druid") then
+    --         healersAlive = healersAlive + 1
+    --         lastHealer = p
+    --     end
+    -- end
+    -- if healersAlive == 1 and survivors > 1 then
+    --     severity = severity + (COMBAT_CONFIG.MOD_SOLO_HEALER or 45)
+    --     table.insert(modifiers, "один хил держит группу")
+    -- end
+    
     -- Итоговый шанс
     local finalChance = math.min(COMBAT_CONFIG.MAX_CHANCE, 
                                   COMBAT_CONFIG.BASE_CHANCE_BOT + severity)
@@ -742,6 +790,8 @@ local function OnLeaveCombat(event, player)
     
     -- Формируем РП-данные для Python
     local rpData = {
+        leader_guid = session.leader_guid,
+        leader_name = session.leader_name,
         speaker_guid = speaker.guid,
         speaker_name = speaker.name,
         speaker_class = speaker.class,
@@ -775,17 +825,12 @@ local function OnLeaveCombat(event, player)
         end
     end
     
-    -- Задержка перед фразой
-    --local delay = math.random(COMBAT_CONFIG.DELAY_MIN, COMBAT_CONFIG.DELAY_MAX)
-    
     -- Сериализуем в JSON
     local jsonData = json.encode(rpData)
     
-    -- Записываем в БД через ai_requests
-    -- Используем speaker как "игрок" (он говорит), а leader группы как target
-    -- FIX v5.1: player_guid = leader (живой игрок получает ответ)
+    -- FIX v5.2: player_guid = leader (живой игрок получает ответ)
     --            npc_guid = speaker (бот, который говорит фразу)
-    -- FIX: убрана искусственная задержка, LLM и так даст 3-4 сек паузы
+    --            target_is_player = 1 (бот — это игрок)
     local sql = string.format(
         "INSERT INTO ai_requests " ..
         "(player_guid, player_name, npc_guid, npc_entry, npc_name, message, channel_type, target_is_player, created_at) " ..
@@ -793,13 +838,27 @@ local function OnLeaveCombat(event, player)
         session.leader_guid, EscapeSQL(session.leader_name), speaker.guid, 0,
         EscapeSQL(speaker.name), EscapeSQL(jsonData), "POST-COMBAT", 1
     )
+    
     local status, err = pcall(function() CharDBExecute(sql) end)
     if status then
-        Log("Post-combat phrase queued for " .. speaker.name .. " in " .. delay .. " sec")
+        Log("Post-combat phrase queued for " .. speaker.name .. " (leader=" .. session.leader_name .. ")")
+        
+        -- FIX v5.2: Добавляем в pendingChecks для доставки ответа!
+        local key = GenerateKey(session.leader_guid)
+        pendingChecks[key] = {
+            playerGuid     = session.leader_guid,
+            playerName     = session.leader_name,
+            targetGuid     = speaker.guid,
+            targetIsPlayer = true,
+            targetName     = speaker.name,
+            retries        = 0,
+        }
+        Log("Added to pendingChecks: leader=" .. session.leader_guid .. " speaker=" .. speaker.guid)
     else
         Log("SQL ERROR (post-combat): " .. tostring(err))
     end
     
+    -- Чистим сессию
     combatSessions[guid] = nil
 end
 
@@ -811,12 +870,12 @@ RegisterPlayerEvent(33, OnEnterCombat)
 RegisterPlayerEvent(34, OnLeaveCombat)
 RegisterPlayerEvent(7, OnKillCreature)
 
-Log("Living Azeroth [v5.0] loaded!")
+Log("Living Azeroth [v5.2] loaded!")
 Log("NPC prefix: '" .. AI_WORLD.NPC_PREFIX .. "'")
 Log("Usage: /s message — bots respond")
 Log("Usage: /s №[NPCName] message — talk to NPC")
 Log("Bot-to-bot replies: " .. (AI_WORLD.BOT_REPLY_TO_BOT_CHANCE > 0 and AI_WORLD.BOT_REPLY_TO_BOT_CHANCE .. "% chance, max depth 2" or "DISABLED"))
-Log("CombatAnalyst: post-combat phrases enabled")
+Log("CombatAnalyst: post-combat phrases enabled (leader-only trigger)")
 
 CreateLuaEvent(GlobalPollLoop, 500, 0)
 Log("GlobalPollLoop started (500ms)")

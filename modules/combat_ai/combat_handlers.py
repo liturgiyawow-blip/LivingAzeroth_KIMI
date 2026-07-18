@@ -39,7 +39,7 @@ class CombatAnalyst:
         self.db.register_callback(self._on_combat_data)
         
         logger.info("CombatAnalyst initialized")
-    
+
     def _on_combat_data(self, request: dict):
         """Обработка данных боя из ai_requests."""
         if request.get("channel_type") != "POST-COMBAT":
@@ -53,9 +53,10 @@ class CombatAnalyst:
         
         speaker_guid = data.get("speaker_guid", 0)
         speaker_name = data.get("speaker_name", "Unknown")
+        leader_guid = data.get("leader_guid", speaker_guid)  # FIX v5.2: fallback на speaker если нет leader
         
-        logger.info("Post-combat phrase triggered! Speaker: %s (guid=%d), Severity: %d",
-                   speaker_name, speaker_guid, data.get("severity", 0))
+        logger.info("Post-combat phrase triggered! Speaker: %s (guid=%d), Leader: %s (guid=%d), Severity: %d",
+                   speaker_name, speaker_guid, data.get("leader_name", "Unknown"), leader_guid, data.get("severity", 0))
         
         self._generate_phrase(data, request)
     
@@ -64,6 +65,7 @@ class CombatAnalyst:
         
         speaker_guid = data["speaker_guid"]
         speaker_name = data["speaker_name"]
+        leader_guid = data.get("leader_guid", speaker_guid)  # FIX v5.2: кто получит ответ в игре
         
         # Собираем контекст для промпта
         context = self._build_combat_context(data)
@@ -84,16 +86,15 @@ class CombatAnalyst:
         # Обработка ответа в фоновом потоке
         threading.Thread(
             target=self._process_llm_response,
-            args=(future, data, request),
+            args=(future, data, request, leader_guid),
             daemon=True,
         ).start()
     
-    def _process_llm_response(self, future, data: dict, request: dict):
+    def _process_llm_response(self, future, data: dict, request: dict, leader_guid: int):
         """Обработать ответ LLM и записать в ai_responses."""
         
         speaker_guid = data["speaker_guid"]
         speaker_name = data["speaker_name"]
-        leader_guid = data.get("leader_guid", speaker_guid)
         
         try:
             result = future.result(timeout=30)
@@ -119,9 +120,12 @@ class CombatAnalyst:
         if emote_id == 0:
             emote_id = self._choose_emote(data)
         
-        # Записываем в ai_responses
-        # player_guid = leader группы (кто получит ответ в Lua)
-        # npc_guid = speaker (бот, который "говорит")
+        # FIX v5.2: Записываем в ai_responses
+        # player_guid = leader группы (живой игрок получает ответ в Lua)
+        # npc_guid = speaker (бот, который "говорит" фразу)
+        logger.info("Writing response: player_guid=%d (leader), npc_guid=%d (speaker), text='%s...'",
+                   leader_guid, speaker_guid, speech[:50])
+        
         self.db.write_response(
             player_guid=leader_guid,
             npc_guid=speaker_guid,
