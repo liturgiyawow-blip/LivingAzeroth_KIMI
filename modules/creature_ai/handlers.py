@@ -1,9 +1,8 @@
 """
-CreatureAIHandler v5.1 — обработчик диалогов с NPC и ботами
+CreatureAIHandler v5.2 — обработчик диалогов с NPC и ботами
 
-ИСПРАВЛЕНИЯ v5.1:
-- FIX: cache_key передаётся в поток (NameError)
-- FIX: player_data содержит memory для prompts.py
+ИСПРАВЛЕНИЯ v5.2:
+- FIX: Игнорируем POST-COMBAT запросы (они для CombatAnalyst)
 """
 
 import time
@@ -69,13 +68,12 @@ class CreatureAIHandler:
         self.db = db_bridge
         
         self._last_talk: Dict[int, float] = {}
-        # FIX v5.0: кэш по (player_guid, npc_guid, text_hash)
         self._cache: Dict[Tuple[int, int, str], dict] = {}
         self._cache_ttl = 3.0
         
         self.db.register_callback(self._on_chat_request)
         
-        logger.info("CreatureAIHandler v5.1 initialized")
+        logger.info("CreatureAIHandler v5.2 initialized")
 
     @staticmethod
     def _text_hash(text: str) -> str:
@@ -90,6 +88,13 @@ class CreatureAIHandler:
         message = request["message"]
         channel = request.get("channel_type", "SAY")
         is_player = request.get("target_is_player", False)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # FIX v5.2: Игнорируем POST-COMBAT — это для CombatAnalyst
+        # ═══════════════════════════════════════════════════════════════
+        if channel == "POST-COMBAT":
+            logger.debug("Ignoring POST-COMBAT request (handled by CombatAnalyst)")
+            return
         
         logger.info("Incoming: %s '%s' → %s (channel=%s, is_player=%s)",
                    player_name, message[:50], npc_name, channel, is_player)
@@ -106,7 +111,6 @@ class CreatureAIHandler:
         
         now = time.time()
         text_hash = self._text_hash(message)
-        # FIX v5.0: кэш включает npc_guid
         cache_key = (player_guid, npc_guid, text_hash)
 
         if now - self._last_talk.get(player_guid, 0) < self._cache_ttl:
@@ -118,32 +122,24 @@ class CreatureAIHandler:
         
         self._ensure_entity_exists(npc_guid, npc_name, npc_entry, is_player)
         
-        # ═══════════════════════════════════════════════════════════════
-        # ЗАГРУЗКА ПАМЯТИ И РЕПУТАЦИИ
-        # ═══════════════════════════════════════════════════════════════
-        
         db_memory = []
         
         if not is_player:
-            # NPC: память из npc_memory
             db_memory = self.db.get_npc_memory(npc_guid, player_guid, limit=5)
             if db_memory:
                 self.world.set_nested(f"entities.{npc_guid}.memory", db_memory)
                 logger.debug("Loaded %d memories from DB for NPC %d", len(db_memory), npc_guid)
             
-            # NPC: репутация из npc_reputation
             npc_rep = self.db.get_npc_reputation(npc_guid, player_guid)
             self.world.set_nested(f"entities.{npc_guid}.reputation_to_player", npc_rep)
             logger.debug("Loaded reputation %d for NPC %d", npc_rep, npc_guid)
         
         else:
-            # БОТ: память из bot_memory
             db_memory = self.db.get_bot_memory(npc_guid, player_guid, limit=5)
             if db_memory:
                 self.world.set_nested(f"entities.{npc_guid}.memory", db_memory)
                 logger.debug("Loaded %d memories from DB for bot %d", len(db_memory), npc_guid)
             
-            # БОТ: репутация из bot_reputation
             bot_rep = self.db.get_bot_reputation(npc_guid, player_guid)
             self.world.set_nested(f"entities.{npc_guid}.reputation_to_player", bot_rep)
             logger.debug("Loaded reputation %d for bot %d", bot_rep, npc_guid)
@@ -151,14 +147,13 @@ class CreatureAIHandler:
         ctx = self.world.get_full_context(str(npc_guid))
         entity_data = ctx.get("npc", {})
         
-        # FIX v5.1: добавляем memory в player_data!
         player_data = {
             "name": player_name,
             "guid": player_guid,
             "race": "Unknown",
             "class": "Unknown",
             "reputation": entity_data.get("reputation_to_player", 0),
-            "memory": db_memory,  # ← FIX: передаём память в промпт!
+            "memory": db_memory,
         }
         
         if is_player:
@@ -168,9 +163,6 @@ class CreatureAIHandler:
         
         user_prompt = prompts.build_user_prompt(message, channel, is_player)
         
-        # ═══════════════════════════════════════════════════════════════
-        # ЛОГИРОВАНИЕ ПРОМПТОВ
-        # ═══════════════════════════════════════════════════════════════
         target_type = "BOT" if is_player else "NPC"
         prompt_logger.debug(
             f"[{target_type}] GUID={npc_guid} Name={npc_name} | Player={player_name}\n"
@@ -190,7 +182,6 @@ class CreatureAIHandler:
             priority=priority,
         )
 
-        # FIX v5.1: передаём cache_key в поток!
         threading.Thread(
             target=self._process_llm_response,
             args=(future, player_guid, npc_guid, npc_entry, 
@@ -200,7 +191,7 @@ class CreatureAIHandler:
     
     def _process_llm_response(self, future, player_guid, npc_guid, 
                              npc_entry, player_name, message, is_player, channel,
-                             cache_key: Tuple[int, int, str]):  # ← FIX: принимаем cache_key
+                             cache_key: Tuple[int, int, str]):
         try:
             result = future.result(timeout=15)
         except Exception as e:
@@ -210,7 +201,6 @@ class CreatureAIHandler:
         
         validated = validators.validate_response(result, "bot" if is_player else "NPC")
         
-        # Логирование ответа
         target_type = "BOT" if is_player else "NPC"
         raw_content = result.get("speech", str(result)) if isinstance(result, dict) else str(result)
         prompt_logger.debug(
@@ -226,10 +216,6 @@ class CreatureAIHandler:
         self._update_entity_state(npc_guid, validated, message, is_player, player_guid)
         self._send_response(player_guid, npc_guid, npc_entry, validated, is_player)
         
-        # ═══════════════════════════════════════════════════════════════
-        # СОХРАНЕНИЕ ПАМЯТИ И РЕПУТАЦИИ
-        # ═══════════════════════════════════════════════════════════════
-        
         try:
             mood_val = int(validated.get("mood_change", 0))
         except (ValueError, TypeError):
@@ -238,7 +224,6 @@ class CreatureAIHandler:
         current_mood_score = self.world.get_nested(f"entities.{npc_guid}.mood_score", 0)
         
         if not is_player:
-            # NPC: сохраняем в npc_memory, npc_reputation
             self.db.save_npc_memory(
                 npc_guid=npc_guid,
                 npc_entry=npc_entry,
@@ -261,7 +246,6 @@ class CreatureAIHandler:
             logger.debug("Saved memory and reputation for NPC %d", npc_guid)
         
         else:
-            # БОТ: сохраняем в bot_memory, bot_reputation
             self.db.save_bot_memory(
                 bot_guid=npc_guid,
                 player_guid=player_guid,
@@ -281,7 +265,6 @@ class CreatureAIHandler:
             
             logger.debug("Saved memory and reputation for bot %d", npc_guid)
         
-        # FIX v5.1: cache_key теперь определена!
         self._last_talk[player_guid] = time.time()
         self._cache[cache_key] = validated
 

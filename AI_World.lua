@@ -4,7 +4,12 @@ if _G.LivingAzerothLoaded then
 end
 _G.LivingAzerothLoaded = true
 
-print("[LivingAzeroth] === FILE LOADING v4.2 ===")
+print("[LivingAzeroth] === FILE LOADING v5.0 ===")
+
+-- ============================================
+-- JSON БИБЛИОТЕКА
+-- ============================================
+local json = require("json")
 
 -- ============================================
 -- НАСТРОЙКИ
@@ -258,7 +263,7 @@ local function HandleBotSay(player, msg)
         local botGuid = bot:GetGUIDLow()
         
         if WriteRequestToDB(player, bot, msg, "SAY-BOT", true) then
-            DebugToPlayer(player, "→ " .. botName)
+            DebugToPlayer(player, "-> " .. botName)
             local key = GenerateKey(player:GetGUIDLow())
             pendingChecks[key] = {
                 playerGuid     = player:GetGUIDLow(),
@@ -487,14 +492,331 @@ local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
 end
 
 -- ============================================
+-- COMBAT ANALYST MODULE v1.0 — РП-версия
+-- ============================================
+
+local COMBAT_CONFIG = {
+    -- Шанс базовый (живой игрок говорит после боя)
+    BASE_CHANCE_PLAYER = 0,
+    
+    -- Шанс базовый (бот комментирует после боя)
+    BASE_CHANCE_BOT = 15,
+    
+    -- Модификаторы тяжести (складываются к BASE_CHANCE_BOT)
+    MOD_EASY_FIGHT = 0,
+    MOD_WOUNDED = 15,
+    MOD_CRITICALLY_WOUNDED = 30,
+    MOD_DEATH = 50,
+    MOD_BOSS_KILL = 20,
+    MOD_LONG_FIGHT = 10,
+    MOD_SOLO_SURVIVOR = 60,
+    
+    -- Максимальный шанс
+    MAX_CHANCE = 85,
+    
+    -- Задержка перед фразой (секунды)
+    --DELAY_MIN = 0,
+    --DELAY_MAX = 1,
+}
+
+-- Хранилище боёв: [leader_guid] = session_data
+local combatSessions = {}
+
+-- РП-описания состояния ранений
+local WOUND_DESCRIPTIONS = {
+    [0] = "без царапины",
+    [1] = "лёгкие царапины",
+    [2] = "серьёзные раны",
+    [3] = "на грани смерти",
+    [4] = "пал в бою",
+}
+
+-- РП-описания длительности боя
+local DURATION_DESCRIPTIONS = {
+    short = "краткая схватка",
+    medium = "ожесточённый бой",
+    long = "долгая, изнурительная резня",
+    epic = "битва, о которой будут слагать легенды",
+}
+
+-- Описать состояние ранений персонажа (РП, без процентов)
+local function DescribeWoundState(hpStart, hpEnd, deaths)
+    if deaths > 0 then return WOUND_DESCRIPTIONS[4] end
+    local lost = hpStart - hpEnd
+    if lost < 10 then return WOUND_DESCRIPTIONS[0]
+    elseif lost < 30 then return WOUND_DESCRIPTIONS[1]
+    elseif lost < 60 then return WOUND_DESCRIPTIONS[2]
+    else return WOUND_DESCRIPTIONS[3] end
+end
+
+-- Описать длительность боя (РП)
+local function DescribeDuration(seconds)
+    if seconds < 30 then return DURATION_DESCRIPTIONS.short
+    elseif seconds < 120 then return DURATION_DESCRIPTIONS.medium
+    elseif seconds < 300 then return DURATION_DESCRIPTIONS.long
+    else return DURATION_DESCRIPTIONS.epic end
+end
+
+-- ============================================
+-- COMBAT EVENT HANDLERS
+-- ============================================
+
+-- Игрок вошёл в бой
+-- Игрок вошёл в бой
+local function OnEnterCombat(event, player, enemy)
+    -- FIX v5.1: Только живой игрок триггерит CombatAnalyst
+    -- Боты в группе уже учтены как участники
+    local okIsBot, isBot = pcall(function() return player:IsBot() end)
+    if okIsBot and isBot then
+        return  -- Игнорируем combat ботов
+    end
+    
+    local guid = player:GetGUIDLow()
+    local group = player:GetGroup()
+    if not group then return end
+    
+    -- Собираем ТОЛЬКО ботов в группе
+    local members = group:GetMembers()
+    local participants = {}
+    
+    for _, member in ipairs(members) do
+        local ok, isBotMember = pcall(function() return member:IsBot() end)
+        if ok and isBotMember then
+            table.insert(participants, {
+                guid = member:GetGUIDLow(),
+                name = member:GetName(),
+                class = member:GetClassAsString(),
+                race = member:GetRaceAsString(),
+                hp_start = member:GetHealthPct(),
+                max_hp = member:GetMaxHealth(),
+                deaths = 0,
+            })
+        end
+    end
+    
+    if #participants == 0 then return end
+    
+    combatSessions[guid] = {
+        active = true,
+        start_time = os.time(),
+        leader_guid = guid,
+        leader_name = player:GetName(),
+        participants = participants,
+        enemies = {},
+        total_deaths = 0,
+        boss_killed = false,
+    }
+    
+    Log("Combat session started for " .. player:GetName() .. " with " .. #participants .. " bots")
+end
+-- Игрок убил существо
+local function OnKillCreature(event, player, killed)
+    local guid = player:GetGUIDLow()
+    local session = combatSessions[guid]
+    if not session or not session.active then return end
+    
+    local enemyName = killed:GetName()
+    table.insert(session.enemies, enemyName)
+    
+    -- Проверяем, босс ли это (по rank или здоровью)
+    local ok, rank = pcall(function() return killed:GetRank() end)
+    local ok2, maxHp = pcall(function() return killed:GetMaxHealth() end)
+    if (ok and rank >= 2) or (ok2 and maxHp > 100000) then
+        session.boss_killed = true
+        session.boss_name = enemyName
+    end
+end
+
+-- Игрок вышел из боя
+local function OnLeaveCombat(event, player)
+    local guid = player:GetGUIDLow()
+    local session = combatSessions[guid]
+    if not session or not session.active then return end
+    
+    session.active = false
+    session.end_time = os.time()
+    session.duration = session.end_time - session.start_time
+    
+    -- Собираем финальные данные
+    for _, p in ipairs(session.participants) do
+        local member = FindPlayerByGUIDLow(p.guid)
+        if member then
+            p.hp_end = member:GetHealthPct()
+            if not p.hp_end then p.hp_end = 0 end
+        else
+            -- Бот не в мире — считаем мёртвым
+            p.hp_end = 0
+            p.deaths = 1
+        end
+    end
+    
+    -- Анализируем тяжесть боя
+    local severity = 0
+    local modifiers = {}
+    
+    local hasWounded = false
+    local hasCriticallyWounded = false
+    local hasDeath = false
+    
+    for _, p in ipairs(session.participants) do
+        if p.deaths > 0 then
+            hasDeath = true
+        else
+            local lost = (p.hp_start or 100) - (p.hp_end or 0)
+            if lost >= 60 then hasCriticallyWounded = true
+            elseif lost >= 30 then hasWounded = true end
+        end
+    end
+    
+    if hasDeath then 
+        severity = severity + COMBAT_CONFIG.MOD_DEATH
+        table.insert(modifiers, "потери")
+    elseif hasCriticallyWounded then
+        severity = severity + COMBAT_CONFIG.MOD_CRITICALLY_WOUNDED
+        table.insert(modifiers, "тяжёлые ранения")
+    elseif hasWounded then
+        severity = severity + COMBAT_CONFIG.MOD_WOUNDED
+        table.insert(modifiers, "ранения")
+    else
+        severity = severity + COMBAT_CONFIG.MOD_EASY_FIGHT
+        table.insert(modifiers, "лёгкий бой")
+    end
+    
+    -- Длительность
+    if session.duration > 180 then
+        severity = severity + COMBAT_CONFIG.MOD_LONG_FIGHT
+        table.insert(modifiers, "долгий бой")
+    end
+    
+    -- Босс
+    if session.boss_killed then
+        severity = severity + COMBAT_CONFIG.MOD_BOSS_KILL
+        table.insert(modifiers, "падение врага")
+    end
+    
+    -- Соло-выживший
+    local survivors = 0
+    local lastSurvivor = nil
+    for _, p in ipairs(session.participants) do
+        if p.deaths == 0 then
+            survivors = survivors + 1
+            lastSurvivor = p
+        end
+    end
+    
+    if survivors == 1 and #session.participants > 1 then
+        severity = severity + COMBAT_CONFIG.MOD_SOLO_SURVIVOR
+        table.insert(modifiers, "единственный выживший")
+    end
+    
+    -- Итоговый шанс
+    local finalChance = math.min(COMBAT_CONFIG.MAX_CHANCE, 
+                                  COMBAT_CONFIG.BASE_CHANCE_BOT + severity)
+    
+    -- Выбираем говорящего (случайный живой бот)
+    local speaker = nil
+    local aliveBots = {}
+    for _, p in ipairs(session.participants) do
+        if p.deaths == 0 then table.insert(aliveBots, p) end
+    end
+    
+    if #aliveBots > 0 then
+        speaker = aliveBots[math.random(1, #aliveBots)]
+    end
+    
+    if not speaker then
+        Log("No survivors to comment on combat")
+        combatSessions[guid] = nil
+        return
+    end
+    
+    -- Ролл шанса
+    local roll = math.random(1, 100)
+    Log("Combat ended. Chance: " .. finalChance .. "%, rolled: " .. roll)
+    
+    if roll > finalChance then
+        Log("No post-combat phrase (roll failed)")
+        combatSessions[guid] = nil
+        return
+    end
+    
+    -- Формируем РП-данные для Python
+    local rpData = {
+        speaker_guid = speaker.guid,
+        speaker_name = speaker.name,
+        speaker_class = speaker.class,
+        speaker_race = speaker.race,
+        duration_desc = DescribeDuration(session.duration),
+        duration_sec = session.duration,
+        severity = severity,
+        modifiers = modifiers,
+        casualties = {},
+        wounded = {},
+        heroes = {},
+        boss_name = session.boss_name or nil,
+        enemy_count = #session.enemies,
+    }
+    
+    for _, p in ipairs(session.participants) do
+        if p.deaths > 0 then
+            table.insert(rpData.casualties, p.name)
+        else
+            local lost = (p.hp_start or 100) - (p.hp_end or 0)
+            if lost >= 60 then
+                table.insert(rpData.wounded, { name = p.name, state = "на грани смерти" })
+            elseif lost >= 30 then
+                table.insert(rpData.wounded, { name = p.name, state = "серьёзно ранен" })
+            end
+            
+            -- Герой: выжил при тяжёлых потерях
+            if lost >= 50 and (#rpData.casualties > 0 or session.duration > 180) then
+                table.insert(rpData.heroes, p.name)
+            end
+        end
+    end
+    
+    -- Задержка перед фразой
+    --local delay = math.random(COMBAT_CONFIG.DELAY_MIN, COMBAT_CONFIG.DELAY_MAX)
+    
+    -- Сериализуем в JSON
+    local jsonData = json.encode(rpData)
+    
+    -- Записываем в БД через ai_requests
+    -- Используем speaker как "игрок" (он говорит), а leader группы как target
+    -- FIX v5.1: player_guid = leader (живой игрок получает ответ)
+    --            npc_guid = speaker (бот, который говорит фразу)
+    -- FIX: убрана искусственная задержка, LLM и так даст 3-4 сек паузы
+    local sql = string.format(
+        "INSERT INTO ai_requests " ..
+        "(player_guid, player_name, npc_guid, npc_entry, npc_name, message, channel_type, target_is_player, created_at) " ..
+        "VALUES (%u, '%s', %u, %d, '%s', '%s', '%s', %d, UNIX_TIMESTAMP())",
+        session.leader_guid, EscapeSQL(session.leader_name), speaker.guid, 0,
+        EscapeSQL(speaker.name), EscapeSQL(jsonData), "POST-COMBAT", 1
+    )
+    local status, err = pcall(function() CharDBExecute(sql) end)
+    if status then
+        Log("Post-combat phrase queued for " .. speaker.name .. " in " .. delay .. " sec")
+    else
+        Log("SQL ERROR (post-combat): " .. tostring(err))
+    end
+    
+    combatSessions[guid] = nil
+end
+
+-- ============================================
 -- REGISTRATION
 -- ============================================
 RegisterPlayerEvent(18, OnPlayerChat)
-Log("Living Azeroth [v4.2] loaded!")
+RegisterPlayerEvent(33, OnEnterCombat)
+RegisterPlayerEvent(34, OnLeaveCombat)
+RegisterPlayerEvent(7, OnKillCreature)
+
+Log("Living Azeroth [v5.0] loaded!")
 Log("NPC prefix: '" .. AI_WORLD.NPC_PREFIX .. "'")
 Log("Usage: /s message — bots respond")
 Log("Usage: /s №[NPCName] message — talk to NPC")
 Log("Bot-to-bot replies: " .. (AI_WORLD.BOT_REPLY_TO_BOT_CHANCE > 0 and AI_WORLD.BOT_REPLY_TO_BOT_CHANCE .. "% chance, max depth 2" or "DISABLED"))
+Log("CombatAnalyst: post-combat phrases enabled")
 
 CreateLuaEvent(GlobalPollLoop, 500, 0)
 Log("GlobalPollLoop started (500ms)")

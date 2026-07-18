@@ -1,6 +1,6 @@
 """
 Living Azeroth — главный файл
-NPC диалоги + боты через SAY канал
+NPC диалоги + боты через SAY канал + CombatAnalyst
 """
 
 import json
@@ -20,6 +20,16 @@ from core.module_registry import ModuleRegistry
 from wow_connector.db_bridge import WoWDBBridge
 from modules.creature_ai.handlers import CreatureAIHandler
 
+# ═══════════════════════════════════════════════════════════════════
+# COMBAT ANALYST — НОВЫЙ МОДУЛЬ
+# ═════════════════════════════════════════════════════════════════==
+try:
+    from modules.combat_ai.combat_handlers import CombatAnalyst
+    COMBAT_AI_AVAILABLE = True
+except ImportError as e:
+    COMBAT_AI_AVAILABLE = False
+    logging.warning("CombatAnalyst not loaded: %s", e)
+
 # ─── ЛОГИРОВАНИЕ ───
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
@@ -33,7 +43,7 @@ logger = logging.getLogger("main")
 
 # ─── ИНИЦИАЛИЗАЦИЯ ───
 logger.info("=" * 50)
-logger.info("Living Azeroth [NPC + Bots] starting...")
+logger.info("Living Azeroth [NPC + Bots + Combat] starting...")
 logger.info("=" * 50)
 
 app = Flask(__name__)
@@ -54,6 +64,16 @@ creature_handler = CreatureAIHandler(world_state, llm_queue, event_bus, db_bridg
 registry.register_module("creature_ai", creature_handler)
 logger.info("CreatureAIHandler registered")
 
+# ═══════════════════════════════════════════════════════════════════
+# РЕГИСТРАЦИЯ COMBAT ANALYST
+# ═════════════════════════════════════════════════════════════════==
+if COMBAT_AI_AVAILABLE:
+    combat_analyst = CombatAnalyst(world_state, llm_queue, db_bridge)
+    registry.register_module("combat_ai", combat_analyst)
+    logger.info("CombatAnalyst registered")
+else:
+    logger.warning("CombatAnalyst disabled — module not found")
+
 # Запуск DB Bridge (начать polling MySQL)
 db_bridge.start()
 
@@ -69,7 +89,7 @@ def health():
 
     return jsonify({
         "status": "ok",
-        "mode": "npc+bots",
+        "mode": "npc+bots+combat",
         "queue_size": llm_queue.get_queue_size(),
         "current_task": current,
         "stats": stats,
@@ -103,7 +123,7 @@ if __name__ == "__main__":
     logger.info("MySQL: %s:%d (game=%s)", config.MYSQL_HOST, config.MYSQL_PORT,
                 config.MYSQL_DB_CHARACTERS)
     logger.info("Modules loaded: %s", list(registry._handlers.keys()))
-    logger.info("Mode: NPC + Bots (dialogs, memory)")
+    logger.info("Mode: NPC + Bots + CombatAnalyst")
     logger.info("Press Ctrl+C to stop")
 
     try:
