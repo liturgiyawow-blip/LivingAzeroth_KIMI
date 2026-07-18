@@ -26,6 +26,7 @@ data/*.json
 config.private.py
 разработыч_тхт/
 Text Document.txt
+README_NPC.md
 
 # === Мусор операционных систем и сред разработки ===
 .DS_Store
