@@ -29,7 +29,10 @@ MYSQL_PORT = 3306
 MYSQL_USER = os.getenv("MYSQL_USER", "acore")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "acore")  # дефолт, если .env не найден
 MYSQL_DB_WORLD = "acore_world"
-MYSQL_DB_CHARACTERS = "acore_characters"  # сюда пишем наши таблицы
+MYSQL_DB_CHARACTERS = "acore_characters"  # ai_requests, ai_responses, characters
+
+# ─── MySQL: AI база (LivingAzeroth) ───
+MYSQL_DB_AI = "livingazeroth_ai"  # memory, reputation, profiles, quests
 
 # ─── TTS — ВЫРЕЗАНО ───
 TTS_ENABLED = False
@@ -52,8 +55,3 @@ PRIORITY_TOKENS = {
     2: 80,    # Мезо: события
     3: 200,   # Макро: фон
 }
-
-# ═══════════════════════════════════════════════════════════════════
-# НОВОЕ: Настройка модели LM Studio
-# ═══════════════════════════════════════════════════════════════════
-LLM_MODEL_NAME = "eva-abliterated-ties-qwen2.5-14b-i1@q6_k"  # Имя модели в LM Studio

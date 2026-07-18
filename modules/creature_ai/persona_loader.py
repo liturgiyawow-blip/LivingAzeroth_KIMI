@@ -30,11 +30,11 @@ class PersonaLoader:
 
     Пример:
         loader = PersonaLoader()
-        persona = loader.get_persona("schoolkids")
+        persona = loader.get_persona("roleplayers")
         prompt = persona["system_prompt_addendum"]
     """
 
-    def __init__(self, persona_file: Path = None, default_persona: str = "schoolkids"):
+    def __init__(self, persona_file: Path = None, default_persona: str = "roleplayers"):
         self._persona_file = persona_file or (config.DATA_DIR / "personas" / "default_personas.json")
         self._default_persona = default_persona
         self._personas: Dict[str, dict] = {}
@@ -172,7 +172,7 @@ def get_persona_loader() -> PersonaLoader:
     return _persona_loader_instance
 
 
-def init_persona_loader(persona_file: Path = None, default: str = "schoolkids") -> PersonaLoader:
+def init_persona_loader(persona_file: Path = None, default: str = "roleplayers") -> PersonaLoader:
     """Инициализировать PersonaLoader с параметрами."""
     global _persona_loader_instance
     _persona_loader_instance = PersonaLoader(persona_file, default)

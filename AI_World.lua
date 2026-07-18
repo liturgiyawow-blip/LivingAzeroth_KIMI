@@ -4,7 +4,7 @@ if _G.LivingAzerothLoaded then
 end
 _G.LivingAzerothLoaded = true
 
-print("[LivingAzeroth] === FILE LOADING v4.1 ===")
+print("[LivingAzeroth] === FILE LOADING v4.2 ===")
 
 -- ============================================
 -- НАСТРОЙКИ
@@ -14,6 +14,8 @@ local AI_WORLD = {
     FIND_RADIUS   = 100,
     NPC_PREFIX = "№",
     DEBUG = true,
+    -- FIX: Шанс ответа боту на сообщение бота (0 = отключено, 10 = 10%)
+    BOT_REPLY_TO_BOT_CHANCE = 5,
 }
 
 -- ============================================
@@ -50,8 +52,6 @@ local function IsRealNPC(creature)
     if not creature then return false end
     local okFlags, npcFlags = pcall(function() return creature:GetNPCFlags() end)
     if okFlags and npcFlags and npcFlags > 0 then return true end
-    -- FIX: Убрали fallback на Humanoid+Class — это пропускало врагов (кобольды и т.д.)
-    -- Теперь только npcFlags > 0 = реальный NPC (торговцы, квестодатели, стражники)
     return false
 end
 
@@ -318,10 +318,8 @@ local function HandleNPCSay(player, msg)
             local okAlive = pcall(function() return c:IsAlive() end)
             if okAlive and c:IsAlive() then
                 if IsRealNPC(c) then
-                    -- FIX: Проверяем, не враждебный ли NPC
                     local okAttack, canAttack = pcall(function() return c:CanStartAttack(player, true) end)
                     if okAttack and canAttack then
-                        -- Враг, пропускаем
                         goto continue_npc_loop
                     end
                     
@@ -433,10 +431,46 @@ end
 -- ============================================
 -- MAIN HANDLER
 -- ============================================
+
+-- FIX: Счётчик ответов ботов на ботов (защита от цепной реакции)
+local botReplyDepth = {}
+
 local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
     Log(string.format("=== EVENT18 === msgType=%d msg='%s'", msgType, msg))
     if not msg or #msg < 1 then return end
     if msg:sub(1, 1) == "." then return end
+
+    -- FIX: Проверяем, говорит ли бот
+    local okIsBot, isBot = pcall(function() return player:IsBot() end)
+    if okIsBot and isBot then
+        -- Это бот говорит
+        if AI_WORLD.BOT_REPLY_TO_BOT_CHANCE <= 0 then
+            -- 0% — полностью игнорируем сообщения ботов
+            Log("Bot speech ignored (BOT_REPLY_TO_BOT_CHANCE = 0)")
+            return
+        end
+        
+        -- Проверяем глубину цепочки
+        local botGuid = player:GetGUIDLow()
+        local depth = botReplyDepth[botGuid] or 0
+        if depth >= 2 then
+            Log("Bot reply depth limit reached for " .. botGuid)
+            return
+        end
+        
+        -- Шанс ответить
+        if math.random(1, 100) > AI_WORLD.BOT_REPLY_TO_BOT_CHANCE then
+            Log("Bot speech ignored (chance roll failed)")
+            return
+        end
+        
+        -- Разрешаем ответ, увеличиваем глубину
+        botReplyDepth[botGuid] = depth + 1
+        Log("Bot speech ALLOWED (depth=" .. (depth + 1) .. ", chance=" .. AI_WORLD.BOT_REPLY_TO_BOT_CHANCE .. "%)")
+    else
+        -- Живой игрок — сбрасываем счётчики глубины
+        botReplyDepth = {}
+    end
 
     if msgType == CHAT_SAY then
         if HandleNPCSay(player, msg) then
@@ -456,10 +490,11 @@ end
 -- REGISTRATION
 -- ============================================
 RegisterPlayerEvent(18, OnPlayerChat)
-Log("Living Azeroth [v4.1] loaded!")
+Log("Living Azeroth [v4.2] loaded!")
 Log("NPC prefix: '" .. AI_WORLD.NPC_PREFIX .. "'")
 Log("Usage: /s message — bots respond")
 Log("Usage: /s №[NPCName] message — talk to NPC")
+Log("Bot-to-bot replies: " .. (AI_WORLD.BOT_REPLY_TO_BOT_CHANCE > 0 and AI_WORLD.BOT_REPLY_TO_BOT_CHANCE .. "% chance, max depth 2" or "DISABLED"))
 
 CreateLuaEvent(GlobalPollLoop, 500, 0)
 Log("GlobalPollLoop started (500ms)")

@@ -1,5 +1,10 @@
 """
 WoWDBBridge — MySQL-based bridge between Python and WoW Eluna
+
+ИСПРАВЛЕНИЕ v5.0:
+- ai_requests/ai_responses → acore_characters (игровая база)
+- Всё остальное → livingazeroth_ai (AI база)
+- Добавлены bot_memory, bot_reputation
 """
 
 import time
@@ -19,7 +24,7 @@ class WoWDBBridge:
     """
     Читает ai_requests из MySQL, отправляет в обработчики,
     пишет ai_responses обратно в MySQL.
-    Управляет npc_memory и npc_reputation.
+    Управляет npc_memory, npc_reputation, bot_memory, bot_reputation.
     """
 
     def __init__(self):
@@ -27,7 +32,8 @@ class WoWDBBridge:
         self._callbacks: List[Callable] = []
         self._last_request_id = 0
         
-        self._db_config = {
+        # ─── Игровая база: ai_requests, ai_responses, characters ───
+        self._game_db_config = {
             "host": config.MYSQL_HOST,
             "port": config.MYSQL_PORT,
             "user": config.MYSQL_USER,
@@ -37,27 +43,54 @@ class WoWDBBridge:
             "autocommit": True,
         }
         
-        self._test_connection()
+        # ─── AI база: memory, reputation, profiles, quests ───
+        self._ai_db_config = {
+            "host": config.MYSQL_HOST,
+            "port": config.MYSQL_PORT,
+            "user": config.MYSQL_USER,
+            "password": config.MYSQL_PASSWORD,
+            "database": config.MYSQL_DB_AI,
+            "charset": "utf8mb4",
+            "autocommit": True,
+        }
+        
+        self._test_connections()
         self._init_last_id()
     
-    def _get_conn(self):
-        return pymysql.connect(**self._db_config)
+    def _get_game_conn(self):
+        """Подключение к игровой базе (acore_characters)."""
+        return pymysql.connect(**self._game_db_config)
     
-    def _test_connection(self):
+    def _get_ai_conn(self):
+        """Подключение к AI базе (livingazeroth_ai)."""
+        return pymysql.connect(**self._ai_db_config)
+    
+    def _test_connections(self):
         try:
-            conn = self._get_conn()
+            conn = self._get_game_conn()
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
             conn.close()
-            logger.info("AI DB connected: %s/%s", config.MYSQL_HOST, config.MYSQL_DB_CHARACTERS)
+            logger.info("Game DB connected: %s/%s", config.MYSQL_HOST, config.MYSQL_DB_CHARACTERS)
         except Exception as e:
-            logger.error("MySQL connection failed: %s", e)
+            logger.error("Game DB connection failed: %s", e)
+            raise
+        
+        try:
+            conn = self._get_ai_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.close()
+            logger.info("AI DB connected: %s/%s", config.MYSQL_HOST, config.MYSQL_DB_AI)
+        except Exception as e:
+            logger.error("AI DB connection failed: %s", e)
             raise
 
     def _init_last_id(self):
+        # ai_requests в игровой базе
         conn = None
         try:
-            conn = self._get_conn()
+            conn = self._get_game_conn()
             with conn.cursor() as cur:
                 cur.execute("SELECT MAX(id) as max_id FROM ai_requests")
                 row = cur.fetchone()
@@ -100,7 +133,7 @@ class WoWDBBridge:
     
     def _fetch_new_requests(self) -> List[dict]:
         requests = []
-        conn = self._get_conn()
+        conn = self._get_game_conn()
         try:
             with conn.cursor() as cur:
                 sql = """
@@ -153,7 +186,8 @@ class WoWDBBridge:
     def write_response(self, player_guid: int, npc_guid: int, npc_entry: int,
                        response_text: str, emote_id: int = 0,
                        action_command: str = None, mood_change: str = None):
-        conn = self._get_conn()
+        # ai_responses в игровой базе (Lua читает отсюда)
+        conn = self._get_game_conn()
         try:
             with conn.cursor() as cur:
                 sql = """
@@ -179,11 +213,11 @@ class WoWDBBridge:
                     pass
     
     # ═══════════════════════════════════════════════════════════════
-    # CHARACTER INFO
+    # CHARACTER INFO (игровая база)
     # ═══════════════════════════════════════════════════════════════
     
     def get_character_info(self, guid: int) -> Optional[dict]:
-        conn = self._get_conn()
+        conn = self._get_game_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -223,14 +257,14 @@ class WoWDBBridge:
                     pass
     
     # ═══════════════════════════════════════════════════════════════
-    # NPC MEMORY (долгосрочная память)
+    # NPC MEMORY (AI база — livingazeroth_ai)
     # ═══════════════════════════════════════════════════════════════
     
     def save_npc_memory(self, npc_guid: int, npc_entry: int, player_guid: int,
                         player_name: str, player_message: str, npc_response: str,
                         mood_after: str = "нейтральный", reputation_after: int = 0) -> bool:
-        """Сохранить запись диалога в npc_memory."""
-        conn = self._get_conn()
+        """Сохранить запись диалога в npc_memory (livingazeroth_ai)."""
+        conn = self._get_ai_conn()
         try:
             with conn.cursor() as cur:
                 sql = """
@@ -258,8 +292,8 @@ class WoWDBBridge:
                     pass
     
     def get_npc_memory(self, npc_guid: int, player_guid: int, limit: int = 10) -> list:
-        """Получить историю диалогов NPC с игроком. Возвращает list[dict] для WorldState."""
-        conn = self._get_conn()
+        """Получить историю диалогов NPC с игроком из livingazeroth_ai."""
+        conn = self._get_ai_conn()
         try:
             with conn.cursor() as cur:
                 sql = """
@@ -293,10 +327,14 @@ class WoWDBBridge:
                 except pymysql.Error:
                     pass
     
+    # ═══════════════════════════════════════════════════════════════
+    # NPC REPUTATION (AI база — livingazeroth_ai)
+    # ═══════════════════════════════════════════════════════════════
+    
     def update_npc_reputation(self, npc_guid: int, npc_entry: int, player_guid: int,
                               player_name: str, reputation_change: int = 0) -> int:
         """Обновить репутацию игрока у NPC. Возвращает новую репутацию."""
-        conn = self._get_conn()
+        conn = self._get_ai_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -330,6 +368,169 @@ class WoWDBBridge:
                 return new_rep
         except Exception as e:
             logger.error("Failed to update reputation: %s", e)
+            return 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    def get_npc_reputation(self, npc_guid: int, player_guid: int) -> int:
+        """Получить текущую репутацию игрока у NPC."""
+        conn = self._get_ai_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT reputation FROM npc_reputation WHERE npc_guid = %s AND player_guid = %s",
+                    (npc_guid, player_guid)
+                )
+                row = cur.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error("Failed to get npc_reputation: %s", e)
+            return 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    # ═══════════════════════════════════════════════════════════════
+    # BOT MEMORY (AI база — livingazeroth_ai) — НОВОЕ
+    # ═══════════════════════════════════════════════════════════════
+    
+    def save_bot_memory(self, bot_guid: int, player_guid: int,
+                       player_name: str, player_message: str, bot_response: str,
+                       mood_after: str = "нейтральный", reputation_after: int = 0,
+                       location: str = None) -> bool:
+        """Сохранить запись диалога с ботом в bot_memory."""
+        conn = self._get_ai_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = """
+                    INSERT INTO bot_memory 
+                    (bot_guid, player_guid, player_name, memory_type,
+                     content, player_message, bot_response, mood_after, reputation_after, location, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, UNIX_TIMESTAMP())
+                """
+                content = f"{player_name}: {player_message} → Bot: {bot_response}"
+                cur.execute(sql, (
+                    bot_guid, player_guid, player_name,
+                    "dialogue", content, player_message, bot_response,
+                    mood_after, reputation_after, location
+                ))
+                logger.debug("Memory saved for bot %d, player %d", bot_guid, player_guid)
+                return True
+        except Exception as e:
+            logger.error("Failed to save bot_memory: %s", e)
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    def get_bot_memory(self, bot_guid: int, player_guid: int, limit: int = 10) -> list:
+        """Получить историю диалогов бота с игроком."""
+        conn = self._get_ai_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = """
+                    SELECT player_message, bot_response, mood_after, created_at
+                    FROM bot_memory
+                    WHERE bot_guid = %s AND player_guid = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """
+                cur.execute(sql, (bot_guid, player_guid, limit))
+                rows = cur.fetchall()
+                result = []
+                for row in reversed(rows):
+                    ts = row[3]
+                    time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "unknown"
+                    result.append({
+                        "player_guid": player_guid,
+                        "player_msg": row[0] or "",
+                        "ai_reply": row[1] or "",
+                        "mood": row[2] or "нейтральный",
+                        "timestamp": time_str,
+                    })
+                return result
+        except Exception as e:
+            logger.error("Failed to get bot_memory: %s", e)
+            return []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    # ═══════════════════════════════════════════════════════════════
+    # BOT REPUTATION (AI база — livingazeroth_ai) — НОВОЕ
+    # ═══════════════════════════════════════════════════════════════
+    
+    def update_bot_reputation(self, bot_guid: int, player_guid: int,
+                              player_name: str, reputation_change: int = 0) -> int:
+        """Обновить репутацию игрока у бота. Возвращает новую репутацию."""
+        conn = self._get_ai_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT reputation, total_dialogues FROM bot_reputation WHERE bot_guid = %s AND player_guid = %s",
+                    (bot_guid, player_guid)
+                )
+                row = cur.fetchone()
+                
+                if row:
+                    new_rep = row[0] + reputation_change
+                    new_dialogues = row[1] + 1
+                    rank = self._rep_to_rank(new_rep)
+                    cur.execute(
+                        """UPDATE bot_reputation 
+                           SET reputation = %s, total_dialogues = %s, reputation_rank = %s,
+                               last_interaction_at = UNIX_TIMESTAMP(), player_name = %s
+                           WHERE bot_guid = %s AND player_guid = %s""",
+                        (new_rep, new_dialogues, rank, player_name, bot_guid, player_guid)
+                    )
+                else:
+                    new_rep = reputation_change
+                    rank = self._rep_to_rank(new_rep)
+                    cur.execute(
+                        """INSERT INTO bot_reputation 
+                           (bot_guid, player_guid, player_name, reputation,
+                            reputation_rank, total_dialogues, last_interaction_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, UNIX_TIMESTAMP())""",
+                        (bot_guid, player_guid, player_name, new_rep, rank, 1)
+                    )
+                
+                return new_rep
+        except Exception as e:
+            logger.error("Failed to update bot_reputation: %s", e)
+            return 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except pymysql.Error:
+                    pass
+    
+    def get_bot_reputation(self, bot_guid: int, player_guid: int) -> int:
+        """Получить текущую репутацию игрока у бота."""
+        conn = self._get_ai_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT reputation FROM bot_reputation WHERE bot_guid = %s AND player_guid = %s",
+                    (bot_guid, player_guid)
+                )
+                row = cur.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error("Failed to get bot_reputation: %s", e)
             return 0
         finally:
             if conn is not None:
