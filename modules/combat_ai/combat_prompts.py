@@ -7,10 +7,65 @@ combat_prompts.py — Промпты для LLM при генерации post-c
 
 import json
 import logging
+import os
+from datetime import datetime
 from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════
+# ЛОГИРОВАНИЕ ПРОМПТОВ ДЛЯ ОТЛАДКИ
+# ═══════════════════════════════════════════════════════════════════
+
+PROMPT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt_logs")
+os.makedirs(PROMPT_LOG_DIR, exist_ok=True)
+
+
+def _log_prompt_to_file(system_prompt: str, user_prompt: str, ctx: dict) -> str:
+    """
+    Сохраняет полный промпт в файл для изучения.
+    Возвращает путь к сохранённому файлу.
+    """
+    speaker = ctx.get("speaker_name", "unknown")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{timestamp}_{speaker}.json"
+    filepath = os.path.join(PROMPT_LOG_DIR, filename)
+
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "speaker": speaker,
+        "speaker_race": ctx.get("speaker_race", "unknown"),
+        "speaker_class": ctx.get("speaker_class", "unknown"),
+        "duration_desc": ctx.get("duration_desc", ""),
+        "duration_sec": ctx.get("duration_sec", 0),
+        "severity": ctx.get("severity", 0),
+        "modifiers": ctx.get("modifiers", []),
+        "triggers": ctx.get("triggers", {}),
+        "casualties": ctx.get("casualties", []),
+        "wounded": ctx.get("wounded", []),
+        "heroes": ctx.get("heroes", []),
+        "boss_name": ctx.get("boss_name"),
+        "enemy_count": ctx.get("enemy_count", 0),
+        "enemies_names": ctx.get("enemies_names", []),
+        "participants": ctx.get("participants", []),
+        "speaker_main_hand": ctx.get("speaker_main_hand", "руки"),
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+    }
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(log_entry, f, ensure_ascii=False, indent=2)
+        logger.info(f"[PromptLog] Saved to {filepath}")
+    except Exception as e:
+        logger.error(f"[PromptLog] Failed to save prompt: {e}")
+
+    return filepath
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ПОСТРОЕНИЕ ПРОМПТА
+# ═══════════════════════════════════════════════════════════════════
 
 def build_combat_system_prompt(ctx: dict) -> str:
     """
@@ -19,39 +74,40 @@ def build_combat_system_prompt(ctx: dict) -> str:
     speaker = ctx.get("speaker_name", "Неизвестный")
     speaker_race = ctx.get("speaker_race", "Неизвестная раса")
     speaker_class = ctx.get("speaker_class", "Неизвестный класс")
-    
+    speaker_main_hand = ctx.get("speaker_main_hand", "руки")
+
     duration_desc = ctx.get("duration_desc", "краткая схватка")
     duration_sec = ctx.get("duration_sec", 0)
-    
+
     severity = ctx.get("severity", 0)
     modifiers = ctx.get("modifiers", [])
     triggers = ctx.get("triggers", {})
-    
+
     casualties = ctx.get("casualties", [])
     wounded = ctx.get("wounded", [])
     heroes = ctx.get("heroes", [])
-    
+
     boss_name = ctx.get("boss_name")
     enemy_count = ctx.get("enemy_count", 0)
-    
+    enemies_names = ctx.get("enemies_names", [])
+
     participants = ctx.get("participants", [])
-    
+
     severity_text = _describe_severity(severity, casualties, wounded, duration_sec)
-    
+
     casualties_text = ""
     if casualties:
         casualties_text = f"Павшие в бою: {', '.join(casualties)}. Их кровь не должна быть пролита зря."
-    
+
     wounded_text = ""
     if wounded:
         wounded_lines = [f"{w['name']} — {w['state']}" for w in wounded]
         wounded_text = "Раненые:\n" + "\n".join(f"- {line}" for line in wounded_lines)
-    
+
     heroes_text = ""
     if heroes:
         heroes_text = f"Герои боя (выстояли до конца): {', '.join(heroes)}."
-    
-    enemies_names = ctx.get("enemies_names", [])
+
     enemies_text = ""
     if boss_name:
         enemies_text = f"Главный враг: {boss_name}."
@@ -59,12 +115,12 @@ def build_combat_system_prompt(ctx: dict) -> str:
         enemies_text = f"Враги в схватке: {', '.join(enemies_names)}."
     elif enemy_count > 0:
         enemies_text = f"Врагов в схватке: {enemy_count}."
-    
+
     allies_text = ""
     if participants:
         allies = [p for p in participants if p != speaker]
         if allies:
-            allies_text = f"Союзники в бою: {', '.join(allies)}."    
+            allies_text = f"Союзники в бою: {', '.join(allies)}."
 
     triggers_text = ""
     if triggers:
@@ -81,10 +137,10 @@ def build_combat_system_prompt(ctx: dict) -> str:
                         detail_str = f" ({tdata['details']['count']} из {tdata['details']['total']} пали)"
                     elif "duration" in tdata["details"]:
                         detail_str = f" ({tdata['details']['duration']} сек)"
-                        trigger_lines.append(f"- {tdata['name']}{detail_str}")
+            trigger_lines.append(f"- {tdata['name']}{detail_str}")
         triggers_text = "СРАБОТАВШИЕ СОБЫТИЯ:\n" + "\n".join(trigger_lines)
-    
-    return f"""Ты — {speaker_race}-{speaker_class} по имени {speaker}. Ты живёшь в мире Азерота (World of Warcraft: Wrath of the Lich King). Для тебя это РЕАЛЬНЫЙ мир. Ты НЕ знаешь про "игру", "пк", "интернет", "ботов", "ИИ", "патчи", "дпс метры", "парс", "BiS шмот", "нерфы", "вовхед", "аддоны".
+
+    system_prompt = f"""Ты — {speaker_race}-{speaker_class} по имени {speaker}. Ты живёшь в мире Азерота (World of Warcraft: Wrath of the Lich King). Для тебя это РЕАЛЬНЫЙ мир. Ты НЕ знаешь про "игру", "пк", "интернет", "ботов", "ИИ", "патчи", "дпс метры", "парс", "BiS шмот", "нерфы", "вовхед", "аддоны".
 
 Только что закончился бой. Ты стоишь на поле боя, переводя дыхание.
 
@@ -93,6 +149,7 @@ def build_combat_system_prompt(ctx: dict) -> str:
 ═══════════════════════════════════════════════════════════════════
 
 Ты: {speaker} ({speaker_race}-{speaker_class})
+Твоё оружие: {speaker_main_hand}
 Что произошло: {duration_desc}
 Тяжесть: {severity_text}
 {enemies_text}
@@ -127,9 +184,6 @@ def build_combat_system_prompt(ctx: dict) -> str:
 8. Используй восклицания, риторические вопросы, обращения к Свету/Тьме/Предкам.
 9. Максимум 80 слов.
 10. Только JSON формат:
-11. ВРАГИ БЫЛИ РЕАЛЬНЫМИ: {enemies_text} НЕ выдумывай демонов, троллей, драконов, элементалей или иных существ, если их не было. НЕ заменяй врагов на других.
-12. СОЮЗНИКИ: {allies_text} Обращайся к ним по именам или корректно по расе/классу. НЕ используй "парни", "братаны", "мужики", если в группе женщины или это звучит нелепо. НЕ обращайся ко всем как к толпе.
-13. Если ты не знаешь имя врага — опиши его внешность по типу (человек-разбойник, гнолл, ворген). Но НЕ выдумывай.
 
 {{
   "speech": "текст реплики",
@@ -138,7 +192,17 @@ def build_combat_system_prompt(ctx: dict) -> str:
 
 ЭМОЦИИ: 0=нет, 1=talk, 3=wave, 14=rude, 18=cry, 25=point, 66=bow, 77=salute
 
+11. ВРАГИ: {enemies_text} Если список пуст — значит, ты не помнишь имен. Но НИКОГДА не заменяй реальных врагов на других. Не превращай медведя в разбойника, а разбойника в демона.
+12. ПОТЕРИ: {casualties_text} Если список павших ПУСТ — ЗНАЧИТ НИКТО НЕ ПОГИБ. НЕ говори "жаль ребят", "потери есть", "память будет жить" если casualties пуст. Это важно.
+13. ОРУЖИЕ: {speaker_main_hand} Не выдумывай другое оружие. Маг с посохом не стреляет луком. Паладин с молотом не рубит секирой.
+14. СОЮЗНИКИ: {allies_text} Обращайся к ним по именам или корректно по расе/классу. НЕ используй "парни", "братаны", "мужики", если в группе женщины или это звучит нелепо.
+
 НЕ ПИШИ markdown, только JSON."""
+
+    user_prompt = build_combat_user_prompt()
+    _log_prompt_to_file(system_prompt, user_prompt, ctx)
+
+    return system_prompt
 
 
 def build_combat_user_prompt() -> str:

@@ -487,6 +487,21 @@ end
 
 local combatSessions = {}
 
+local function GetWeaponName(unit)
+    local weaponName = "руки"
+    local ok, item = pcall(function() return unit:GetMainHand() end)
+    if not ok or not item then
+        ok, item = pcall(function() return unit:GetEquippedItemBySlot(15) end)
+    end
+    if ok and item then
+        local ok2, name = pcall(function() return item:GetName() end)
+        if ok2 and name and name ~= "" then
+            weaponName = name
+        end
+    end
+    return weaponName
+end
+
 local function OnEnterCombat(event, player, enemy)
     local okIsBot, isBot = pcall(function() return player:IsBot() end)
     if okIsBot and isBot then
@@ -519,6 +534,7 @@ local function OnEnterCombat(event, player, enemy)
         mana_start = okMana and manaStart or 100,
         deaths = 0,
         is_player = true,
+        main_hand = GetWeaponName(player),
     })
     
     -- Добавляем ботов
@@ -542,6 +558,7 @@ local function OnEnterCombat(event, player, enemy)
                     mana_start = okMana2 and manaStart2 or 100,
                     deaths = 0,
                     is_player = false,
+                    main_hand = GetWeaponName(member),
                 })
             end
         end
@@ -556,17 +573,22 @@ local function OnEnterCombat(event, player, enemy)
         Log("Combat session restarted for " .. player:GetName())
     end
     
+    local enemyName = "неизвестный враг"
+    if enemy then
+        local ok, name = pcall(function() return enemy:GetName() end)
+        if ok and name then enemyName = name end
+    end
+
     combatSessions[guid] = {
         active = true,
         start_time = os.time(),
         leader_guid = guid,
         leader_name = player:GetName(),
         participants = participants,
-        enemies = {},
+        enemies = { enemyName },
         total_deaths = 0,
         boss_killed = false,
-    }
-    
+    }    
     Log("Combat session started for " .. player:GetName() .. " with " .. (#participants - 1) .. " bots (total " .. #participants .. " participants)")
 end
 
@@ -633,7 +655,7 @@ local function OnLeaveCombat(event, player)
         else
             p.hp_end = 0
             p.mana_end = 0
-            p.deaths = 1
+            --p.deaths = 1
         end
     end
     
@@ -698,6 +720,7 @@ local function OnLeaveCombat(event, player)
         enemies_names = uniqueEnemies,
         boss_name = session.boss_name or nil,
         enemy_count = #session.enemies,
+        speaker_main_hand = speaker.main_hand or "руки",
     }
 
     for _, p in ipairs(session.participants) do
