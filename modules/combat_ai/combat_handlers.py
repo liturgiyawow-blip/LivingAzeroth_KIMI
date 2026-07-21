@@ -24,9 +24,6 @@ logger = logging.getLogger(__name__)
 class CombatAnalyst:
     """
     Анализирует бой и генерирует post-combat фразы от ботов.
-    
-    Работает параллельно с CreatureAIHandler — тот же механизм
-    ai_requests/ai_responses, но отдельная логика обработки.
     """
     
     def __init__(self, world_state: WorldState, llm_queue: PriorityLLMQueue,
@@ -35,7 +32,6 @@ class CombatAnalyst:
         self.llm = llm_queue
         self.db = db_bridge
         
-        # Регистрируем себя как обработчик POST-COMBAT
         self.db.register_callback(self._on_combat_data)
         
         logger.info("CombatAnalyst initialized")
@@ -43,7 +39,7 @@ class CombatAnalyst:
     def _on_combat_data(self, request: dict):
         """Обработка данных боя из ai_requests."""
         if request.get("channel_type") != "POST-COMBAT":
-            return  # Не наш запрос — пусть CreatureAIHandler разбирается
+            return
         
         try:
             data = json.loads(request["message"])
@@ -53,7 +49,7 @@ class CombatAnalyst:
         
         speaker_guid = data.get("speaker_guid", 0)
         speaker_name = data.get("speaker_name", "Unknown")
-        leader_guid = data.get("leader_guid", speaker_guid)  # FIX v5.2: fallback на speaker если нет leader
+        leader_guid = data.get("leader_guid", speaker_guid)
         
         logger.info("Post-combat phrase triggered! Speaker: %s (guid=%d), Leader: %s (guid=%d), Severity: %d",
                    speaker_name, speaker_guid, data.get("leader_name", "Unknown"), leader_guid, data.get("severity", 0))
@@ -65,25 +61,22 @@ class CombatAnalyst:
         
         speaker_guid = data["speaker_guid"]
         speaker_name = data["speaker_name"]
-        leader_guid = data.get("leader_guid", speaker_guid)  # FIX v5.2: кто получит ответ в игре
+        leader_guid = data.get("leader_guid", speaker_guid)
         
-        # Собираем контекст для промпта
         context = self._build_combat_context(data)
         
-        # Строим промпты
         system_prompt = combat_prompts.build_combat_system_prompt(context)
         user_prompt = combat_prompts.build_combat_user_prompt()
         
-        # Отправляем в LLM (приоритет 2 — важно, но не срочно)
+        # FIX v5.3: Увеличили токены для длинных фраз
         future = self.llm.submit(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            temperature=0.8,
-            max_tokens=120,
+            temperature=0.9,  # FIX v5.3: Больше креативности
+            max_tokens=200,   # FIX v5.3: Длинные речи
             priority=2,
         )
         
-        # Обработка ответа в фоновом потоке
         threading.Thread(
             target=self._process_llm_response,
             args=(future, data, request, leader_guid),
@@ -100,10 +93,8 @@ class CombatAnalyst:
             result = future.result(timeout=30)
         except Exception as e:
             logger.error("LLM failed for combat phrase (speaker=%s): %s", speaker_name, e)
-            # Fallback — случайная фраза из примеров
             result = self._fallback_phrase(data)
         
-        # Валидируем
         speech = result.get("speech", "") if isinstance(result, dict) else str(result)
         emote_id = 0
         if isinstance(result, dict):
@@ -112,17 +103,12 @@ class CombatAnalyst:
             except (ValueError, TypeError):
                 emote_id = 0
         
-        # Обрезаем до 255 символов (лимит WoW Say)
         if len(speech) > 255:
             speech = speech[:252] + "..."
         
-        # Выбираем эмоцию по контексту если LLM не дал
         if emote_id == 0:
             emote_id = self._choose_emote(data)
         
-        # FIX v5.2: Записываем в ai_responses
-        # player_guid = leader группы (живой игрок получает ответ в Lua)
-        # npc_guid = speaker (бот, который "говорит" фразу)
         logger.info("Writing response: player_guid=%d (leader), npc_guid=%d (speaker), text='%s...'",
                    leader_guid, speaker_guid, speech[:50])
         
@@ -139,7 +125,6 @@ class CombatAnalyst:
         logger.info("Post-combat phrase from %s: '%s...' (emote=%d)",
                    speaker_name, speech[:50], emote_id)
         
-        # Обновляем мировую хронику
         self.world.append_chronology(
             f"{self.world.get_nested('meta.world_hour', 12)}:00 — "
             f"Bot {speaker_name} commented on combat"
@@ -148,7 +133,6 @@ class CombatAnalyst:
     def _build_combat_context(self, data: dict) -> dict:
         """Преобразовать raw данные Lua в читаемый контекст."""
         
-        # Добавляем список всех участников из данных
         participants = []
         for p in data.get("participants", []):
             if isinstance(p, dict):
@@ -156,7 +140,6 @@ class CombatAnalyst:
             else:
                 participants.append(str(p))
         
-        # Если participants пуст — берём из casualties, wounded, heroes
         if not participants:
             seen = set()
             for name in data.get("casualties", []):
@@ -176,6 +159,7 @@ class CombatAnalyst:
             "duration_sec": data.get("duration_sec", 0),
             "severity": data.get("severity", 0),
             "modifiers": data.get("modifiers", []),
+            "triggers": data.get("triggers", {}),  # FIX v5.3: передаём триггеры
             "casualties": data.get("casualties", []),
             "wounded": data.get("wounded", []),
             "heroes": data.get("heroes", []),
@@ -189,30 +173,36 @@ class CombatAnalyst:
         casualties = data.get("casualties", [])
         wounded = data.get("wounded", [])
         severity = data.get("severity", 0)
+        triggers = data.get("triggers", {})
         
         if casualties:
-            return 18  # cry — скорбь о павших
+            return 18  # cry
+        elif "solo_survivor" in triggers:
+            return 18  # cry
         elif severity >= 50:
-            return 66  # bow — почтение перед тяжёлой битвой
+            return 66  # bow
         elif wounded:
-            return 25  # point — указывает на раненого
+            return 25  # point
         elif severity >= 30:
-            return 1   # talk — серьёзный разговор
+            return 1   # talk
         elif severity <= 5:
-            return 3   # wave — лёгкость, облегчение
-        return 1  # talk — по умолчанию
+            return 3   # wave
+        return 1
     
     def _fallback_phrase(self, data: dict) -> dict:
-        """Fallback если LLM недоступен — случайная фраза из примеров."""
+        """Fallback если LLM недоступен."""
         severity = data.get("severity", 0)
         casualties = data.get("casualties", [])
         wounded = data.get("wounded", [])
         heroes = data.get("heroes", [])
         boss_name = data.get("boss_name")
+        triggers = data.get("triggers", {})
         
         examples = combat_prompts.EXAMPLE_PHRASES
         
-        if casualties:
+        if "solo_survivor" in triggers:
+            pool = examples.get("solo_survivor", ["Я... один..."])
+        elif casualties:
             pool = examples.get("death_comrade", ["Прощай, брат..."])
         elif heroes:
             pool = examples.get("critical_ally", ["Ты выстоял до конца!"])
@@ -220,6 +210,8 @@ class CombatAnalyst:
             pool = examples.get("wounded_ally", ["Ты в порядке, друг?"])
         elif boss_name:
             pool = examples.get("boss_kill", ["Враг пал!"])
+        elif "long_fight" in triggers:
+            pool = examples.get("long_fight", ["Долгий бой..."])
         elif severity >= 15:
             pool = examples.get("long_fight", ["Долгий бой..."])
         else:
@@ -227,7 +219,6 @@ class CombatAnalyst:
         
         speech = random.choice(pool)
         
-        # Подставляем имена если есть
         if casualties and "{name}" in speech:
             speech = speech.replace("{name}", casualties[0])
         if boss_name and "{boss}" in speech:
