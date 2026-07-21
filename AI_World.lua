@@ -488,18 +488,29 @@ end
 local combatSessions = {}
 
 local function GetWeaponName(unit)
-    local weaponName = "руки"
-    local ok, item = pcall(function() return unit:GetMainHand() end)
-    if not ok or not item then
-        ok, item = pcall(function() return unit:GetEquippedItemBySlot(15) end)
-    end
-    if ok and item then
-        local ok2, name = pcall(function() return item:GetName() end)
-        if ok2 and name and name ~= "" then
-            weaponName = name
+    local unitName = "Unknown"
+    pcall(function() unitName = unit:GetName() end)
+    
+    -- Пробуем все известные способы получить оружие
+    local methods = {
+        { name = "GetMainHand",      fn = function() return unit:GetMainHand() end },
+        { name = "GetEquippedItemBySlot(15)", fn = function() return unit:GetEquippedItemBySlot(15) end },
+        { name = "GetEquippedItemBySlot(16)", fn = function() return unit:GetEquippedItemBySlot(16) end },
+    }
+    
+    for _, m in ipairs(methods) do
+        local ok, item = pcall(m.fn)
+        if ok and item then
+            local ok2, itemName = pcall(function() return item:GetName() end)
+            if ok2 and itemName and itemName ~= "" then
+                Log(string.format("[WeaponDebug] %s -> %s via %s", unitName, itemName, m.name))
+                return itemName
+            end
         end
     end
-    return weaponName
+    
+    Log(string.format("[WeaponDebug] %s -> FAILED (all methods returned nil)", unitName))
+    return "руки"
 end
 
 local function OnEnterCombat(event, player, enemy)
@@ -579,6 +590,8 @@ local function OnEnterCombat(event, player, enemy)
         if ok and name then enemyName = name end
     end
 
+    Log(string.format("[CombatDebug] EnterCombat: enemy=%s, enemyName=%s", tostring(enemy), tostring(enemyName)))
+
     combatSessions[guid] = {
         active = true,
         start_time = os.time(),
@@ -597,12 +610,13 @@ local function OnKillCreature(event, player, killed)
     local session = combatSessions[guid]
     if not session or not session.active then return end
     
-    local enemyName = killed:GetName()
+    local ok, enemyName = pcall(function() return killed:GetName() end)
+    if not ok or not enemyName then enemyName = "неизвестный враг" end
     table.insert(session.enemies, enemyName)
     
-    local ok, rank = pcall(function() return killed:GetRank() end)
-    local ok2, maxHp = pcall(function() return killed:GetMaxHealth() end)
-    if (ok and rank >= COMBAT_CONFIG.THRESHOLD_BOSS_RANK) or (ok2 and maxHp > COMBAT_CONFIG.THRESHOLD_BOSS_HP) then
+    local okRank, rank = pcall(function() return killed:GetRank() end)
+    local okHp, maxHp = pcall(function() return killed:GetMaxHealth() end)
+    if (okRank and rank >= COMBAT_CONFIG.THRESHOLD_BOSS_RANK) or (okHp and maxHp > COMBAT_CONFIG.THRESHOLD_BOSS_HP) then
         session.boss_killed = true
         session.boss_name = enemyName
     end
@@ -629,7 +643,12 @@ local function OnLeaveCombat(event, player)
     session.end_time = os.time()
     session.duration = session.end_time - session.start_time
 
-        -- Собираем уникальные имена врагов (макс 5, чтобы не перегружать промпт)
+    -- Собираем уникальные имена врагов (макс 5, чтобы не перегружать промпт)
+        Log(string.format("[CombatDebug] LeaveCombat: enemies count=%d, contents:", #session.enemies))
+    for i, name in ipairs(session.enemies) do
+        Log(string.format("  [%d] = %s", i, tostring(name)))
+    end
+    
     local uniqueEnemies = {}
     local enemySeen = {}
     for _, name in ipairs(session.enemies) do
@@ -655,7 +674,8 @@ local function OnLeaveCombat(event, player)
         else
             p.hp_end = 0
             p.mana_end = 0
-            --p.deaths = 1
+            -- Не ставим deaths = 1: FindPlayerByGUIDLow может не найти живого бота,
+            -- если он отошёл или объект выгружен.
         end
     end
     
