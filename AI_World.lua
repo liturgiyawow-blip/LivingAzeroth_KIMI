@@ -487,15 +487,20 @@ end
 
 local combatSessions = {}
 
+-- ============================================
+-- COMBAT: WEAPON DETECTION v5.3-fix2
+-- ============================================
+
 local function GetWeaponName(unit)
     local unitName = "Unknown"
     pcall(function() unitName = unit:GetName() end)
     
-    -- Пробуем все известные способы получить оружие
+    -- В разных сборках AzerothCore слоты отличаются.
+    -- Проверяем 15, 16, 17 — первый найденный = оружие.
     local methods = {
-        { name = "GetMainHand",      fn = function() return unit:GetMainHand() end },
-        { name = "GetEquippedItemBySlot(15)", fn = function() return unit:GetEquippedItemBySlot(15) end },
-        { name = "GetEquippedItemBySlot(16)", fn = function() return unit:GetEquippedItemBySlot(16) end },
+        { name = "Slot15", fn = function() return unit:GetEquippedItemBySlot(15) end },
+        { name = "Slot16", fn = function() return unit:GetEquippedItemBySlot(16) end },
+        { name = "Slot17", fn = function() return unit:GetEquippedItemBySlot(17) end },
     }
     
     for _, m in ipairs(methods) do
@@ -509,9 +514,14 @@ local function GetWeaponName(unit)
         end
     end
     
-    Log(string.format("[WeaponDebug] %s -> FAILED (all methods returned nil)", unitName))
+    Log(string.format("[WeaponDebug] %s -> FAILED (no weapon)", unitName))
     return "руки"
 end
+
+
+-- ============================================
+-- COMBAT: ENTER COMBAT v5.3-fix2
+-- ============================================
 
 local function OnEnterCombat(event, player, enemy)
     local okIsBot, isBot = pcall(function() return player:IsBot() end)
@@ -525,10 +535,48 @@ local function OnEnterCombat(event, player, enemy)
         return
     end
     
-    local members = group:GetMembers()
+    -- ═══════════════════════════════════════════════════════════════
+    -- FIX v5.3-fix2: Тройной fallback для имени врага
+    -- ═══════════════════════════════════════════════════════════════
+    local enemyName = "неизвестный враг"
+    
+    -- Попытка 1: аргумент события
+    if enemy then
+        local ok, name = pcall(function() return enemy:GetName() end)
+        if ok and name and name ~= "" then
+            enemyName = name
+        end
+    end
+    
+    -- Попытка 2: текущая цель игрока (victim)
+    if enemyName == "неизвестный враг" then
+        local ok, victim = pcall(function() return player:GetVictim() end)
+        if ok and victim then
+            local ok2, name = pcall(function() return victim:GetName() end)
+            if ok2 and name and name ~= "" then
+                enemyName = name
+                Log("[CombatDebug] Enemy resolved from GetVictim: " .. enemyName)
+            end
+        end
+    end
+    
+    -- Попытка 3: выделенная цель (selection)
+    if enemyName == "неизвестный враг" then
+        local ok, selection = pcall(function() return player:GetSelection() end)
+        if ok and selection then
+            local ok2, name = pcall(function() return selection:GetName() end)
+            if ok2 and name and name ~= "" then
+                enemyName = name
+                Log("[CombatDebug] Enemy resolved from GetSelection: " .. enemyName)
+            end
+        end
+    end
+    
+    Log(string.format("[CombatDebug] EnterCombat: final enemyName=%s", enemyName))
+    
     local participants = {}
     
-    -- FIX v5.3: Добавляем ИГРОКА (живого) первым
+    -- Игрок (лидер)
     local okHp, hpStart = pcall(function() return player:GetHealthPct() end)
     local okMaxHp, maxHp = pcall(function() return player:GetMaxHealth() end)
     local okMana, manaStart = pcall(function() return player:GetPowerPct(0) end)
@@ -548,7 +596,8 @@ local function OnEnterCombat(event, player, enemy)
         main_hand = GetWeaponName(player),
     })
     
-    -- Добавляем ботов
+    -- Боты
+    local members = group:GetMembers()
     for _, member in ipairs(members) do
         if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
             local ok, isBotMember = pcall(function() return member:IsBot() end)
@@ -583,14 +632,6 @@ local function OnEnterCombat(event, player, enemy)
     if combatSessions[guid] then
         Log("Combat session restarted for " .. player:GetName())
     end
-    
-    local enemyName = "неизвестный враг"
-    if enemy then
-        local ok, name = pcall(function() return enemy:GetName() end)
-        if ok and name then enemyName = name end
-    end
-
-    Log(string.format("[CombatDebug] EnterCombat: enemy=%s, enemyName=%s", tostring(enemy), tostring(enemyName)))
 
     combatSessions[guid] = {
         active = true,
@@ -604,6 +645,7 @@ local function OnEnterCombat(event, player, enemy)
     }    
     Log("Combat session started for " .. player:GetName() .. " with " .. (#participants - 1) .. " bots (total " .. #participants .. " participants)")
 end
+
 
 local function OnKillCreature(event, player, killed)
     local guid = player:GetGUIDLow()
@@ -621,6 +663,10 @@ local function OnKillCreature(event, player, killed)
         session.boss_name = enemyName
     end
 end
+
+-- ============================================
+-- COMBAT: LEAVE COMBAT v5.3-fix
+-- ============================================
 
 local function OnLeaveCombat(event, player)
     local okIsBot, isBot = pcall(function() return player:IsBot() end)
@@ -643,60 +689,80 @@ local function OnLeaveCombat(event, player)
     session.end_time = os.time()
     session.duration = session.end_time - session.start_time
 
-    -- Собираем уникальные имена врагов (макс 5, чтобы не перегружать промпт)
-        Log(string.format("[CombatDebug] LeaveCombat: enemies count=%d, contents:", #session.enemies))
-    for i, name in ipairs(session.enemies) do
-        Log(string.format("  [%d] = %s", i, tostring(name)))
+    -- Логируем raw enemies
+    Log(string.format("[CombatDebug] LeaveCombat: raw enemies count=%d", #(session.enemies or {})))
+    for i, name in ipairs(session.enemies or {}) do
+        Log(string.format("[CombatDebug]   raw[%d] = %s (type=%s)", i, tostring(name), type(name)))
     end
     
+    -- Дедупликация
     local uniqueEnemies = {}
     local enemySeen = {}
-    for _, name in ipairs(session.enemies) do
-        if not enemySeen[name] then
-            enemySeen[name] = true
-            table.insert(uniqueEnemies, name)
+    for _, name in ipairs(session.enemies or {}) do
+        if name and name ~= "" and name ~= "неизвестный враг" then
+            if not enemySeen[name] then
+                enemySeen[name] = true
+                table.insert(uniqueEnemies, name)
+            end
         end
     end
+    
+    if #uniqueEnemies == 0 and #(session.enemies or {}) > 0 then
+        for _, name in ipairs(session.enemies) do
+            if name and name ~= "" then
+                table.insert(uniqueEnemies, name)
+                Log(string.format("[CombatDebug] Fallback enemy used: %s", tostring(name)))
+                break
+            end
+        end
+    end
+    
     if #uniqueEnemies > 5 then
         local trimmed = {}
         for i = 1, 5 do table.insert(trimmed, uniqueEnemies[i]) end
         uniqueEnemies = trimmed
     end
     
-    -- FIX v5.3: Собираем финальные данные для ВСЕХ участников (игрок + боты)
-    for _, p in ipairs(session.participants) do
+    Log(string.format("[CombatDebug] uniqueEnemies final count=%d", #uniqueEnemies))
+    for i, name in ipairs(uniqueEnemies) do
+        Log(string.format("[CombatDebug]   unique[%d] = %s", i, tostring(name)))
+    end
+    
+    -- FIX: защита от nil для всех участников
+    for _, p in ipairs(session.participants or {}) do
         local member = FindPlayerByGUIDLow(p.guid)
         if member then
             local okHp, hpEnd = pcall(function() return member:GetHealthPct() end)
             local okMana, manaEnd = pcall(function() return member:GetPowerPct(0) end)
-            p.hp_end = okHp and hpEnd or 0
-            p.mana_end = okMana and manaEnd or 0
+            p.hp_end = (okHp and hpEnd) or 0
+            p.mana_end = (okMana and manaEnd) or 0
         else
-            p.hp_end = 0
-            p.mana_end = 0
-            -- Не ставим deaths = 1: FindPlayerByGUIDLow может не найти живого бота,
-            -- если он отошёл или объект выгружен.
+            p.hp_end = p.hp_end or 0
+            p.mana_end = p.mana_end or 0
         end
     end
     
-    -- FIX v5.3: Логируем состояние всех участников для отладки
     Log("=== COMBAT PARTICIPANTS FINAL STATE ===")
-    for _, p in ipairs(session.participants) do
+    for _, p in ipairs(session.participants or {}) do
         local hpLost = (p.hp_start or 100) - (p.hp_end or 0)
         local manaLost = (p.mana_start or 100) - (p.mana_end or 0)
-        Log(string.format("  %s (%s): hp=%d->%d (lost %d%%), mana=%d->%d (lost %d%%), deaths=%d, is_player=%s",
-            p.name, p.class, p.hp_start, p.hp_end, hpLost, p.mana_start, p.mana_end, manaLost, p.deaths, tostring(p.is_player)))
+        -- FIX: защита string.format от nil
+        Log(string.format("  %s (%s): hp=%.0f->%.0f (lost %.0f%%), mana=%.0f->%.0f (lost %.0f%%), deaths=%.0f, is_player=%s",
+            tostring(p.name), tostring(p.class), 
+            (p.hp_start or 0), (p.hp_end or 0), hpLost,
+            (p.mana_start or 0), (p.mana_end or 0), manaLost,
+            (p.deaths or 0), tostring(p.is_player)))
     end
     
     local severity, modifiers, triggers = EvaluateTriggers(session, session.participants)
     
     local finalChance = math.min(COMBAT_CONFIG.MAX_CHANCE, COMBAT_CONFIG.BASE_CHANCE_BOT + severity)
     
-    -- FIX v5.3: Выбираем говорящего только среди БОТОВ (не игрока)
+    -- Выбираем говорящего только среди БОТОВ
     local speaker = nil
     local aliveBots = {}
-    for _, p in ipairs(session.participants) do
-        if not p.is_player and p.deaths == 0 then
+    for _, p in ipairs(session.participants or {}) do
+        if not p.is_player and (p.deaths or 0) == 0 then
             table.insert(aliveBots, p)
         end
     end
@@ -711,6 +777,13 @@ local function OnLeaveCombat(event, player)
         return
     end
     
+    -- FIX: защита speaker
+    if not speaker.guid or not speaker.name then
+        Log("ERROR: selected speaker is invalid")
+        combatSessions[guid] = nil
+        return
+    end
+    
     local roll = math.random(1, 100)
     Log("Combat ended. Chance: " .. finalChance .. "%, rolled: " .. roll .. " (severity=" .. severity .. ")")
     
@@ -720,14 +793,20 @@ local function OnLeaveCombat(event, player)
         return
     end
     
-    -- Формируем РП-данные для Python
+    -- FIX: leader_main_hand из первого участника (игрок)
+    local leaderMainHand = "руки"
+    if session.participants and session.participants[1] and session.participants[1].main_hand then
+        leaderMainHand = session.participants[1].main_hand
+    end
+    
     local rpData = {
         leader_guid = session.leader_guid,
         leader_name = session.leader_name,
+        leader_main_hand = leaderMainHand,
         speaker_guid = speaker.guid,
         speaker_name = speaker.name,
-        speaker_class = speaker.class,
-        speaker_race = speaker.race,
+        speaker_class = speaker.class or "Unknown",
+        speaker_race = speaker.race or "Unknown",
         duration_desc = DescribeDuration(session.duration),
         duration_sec = session.duration,
         severity = severity,
@@ -739,44 +818,53 @@ local function OnLeaveCombat(event, player)
         participants = {},
         enemies_names = uniqueEnemies,
         boss_name = session.boss_name or nil,
-        enemy_count = #session.enemies,
+        enemy_count = #(session.enemies or {}),
         speaker_main_hand = speaker.main_hand or "руки",
     }
 
-    for _, p in ipairs(session.participants) do
-        table.insert(rpData.participants, p.name)
+    for _, p in ipairs(session.participants or {}) do
+        table.insert(rpData.participants, tostring(p.name))
     end
         
-    for _, p in ipairs(session.participants) do
-        if p.deaths > 0 then
-            table.insert(rpData.casualties, p.name)
+    for _, p in ipairs(session.participants or {}) do
+        if (p.deaths or 0) > 0 then
+            table.insert(rpData.casualties, tostring(p.name))
         else
             local lost = (p.hp_start or 100) - (p.hp_end or 0)
             if lost >= COMBAT_CONFIG.THRESHOLD_CRITICAL_HP_LOST then
-                table.insert(rpData.wounded, { name = p.name, state = "на грани смерти" })
+                table.insert(rpData.wounded, { name = tostring(p.name), state = "на грани смерти" })
             elseif lost >= COMBAT_CONFIG.THRESHOLD_WOUNDED_HP_LOST then
-                table.insert(rpData.wounded, { name = p.name, state = "серьёзно ранен" })
+                table.insert(rpData.wounded, { name = tostring(p.name), state = "серьёзно ранен" })
             end
             
             if lost >= COMBAT_CONFIG.THRESHOLD_HERO_HP_LOST and (#rpData.casualties > 0 or session.duration > COMBAT_CONFIG.THRESHOLD_LONG_FIGHT_SEC) then
-                table.insert(rpData.heroes, p.name)
+                table.insert(rpData.heroes, tostring(p.name))
             end
         end
     end
     
     local jsonData = json.encode(rpData)
     
+    Log("[CombatDebug] JSON enemies_names in payload: " .. tostring(#uniqueEnemies))
+    Log("[CombatDebug] JSON first 800 chars: " .. tostring(jsonData):sub(1, 800))
+    
     local sql = string.format(
         "INSERT INTO ai_requests " ..
         "(player_guid, player_name, npc_guid, npc_entry, npc_name, message, channel_type, target_is_player, created_at) " ..
         "VALUES (%u, '%s', %u, %d, '%s', '%s', '%s', %d, UNIX_TIMESTAMP())",
-        session.leader_guid, EscapeSQL(session.leader_name), speaker.guid, 0,
-        EscapeSQL(speaker.name), EscapeSQL(jsonData), "POST-COMBAT", 1
+        tonumber(session.leader_guid) or 0,
+        EscapeSQL(session.leader_name),
+        tonumber(speaker.guid) or 0,
+        0,
+        EscapeSQL(speaker.name),
+        EscapeSQL(jsonData),
+        "POST-COMBAT",
+        1
     )
     
     local status, err = pcall(function() CharDBExecute(sql) end)
     if status then
-        Log("Post-combat phrase queued for " .. speaker.name .. " (leader=" .. session.leader_name .. ")")
+        Log("Post-combat phrase queued for " .. tostring(speaker.name) .. " (leader=" .. tostring(session.leader_name) .. ")")
         
         local key = GenerateKey(session.leader_guid)
         pendingChecks[key] = {

@@ -159,15 +159,19 @@ class CombatAnalyst:
             "duration_sec": data.get("duration_sec", 0),
             "severity": data.get("severity", 0),
             "modifiers": data.get("modifiers", []),
-            "triggers": data.get("triggers", {}),  # FIX v5.3: передаём триггеры
+            "triggers": data.get("triggers", {}),
             "casualties": data.get("casualties", []),
             "wounded": data.get("wounded", []),
             "heroes": data.get("heroes", []),
             "boss_name": data.get("boss_name"),
             "enemy_count": data.get("enemy_count", 0),
             "participants": participants,
+            # FIX: Читаем из JSON вместо хардкода
+            "enemies_names": data.get("enemies_names", []),
+            "speaker_main_hand": data.get("speaker_main_hand", "руки"),
+            "leader_name": data.get("leader_name", "Unknown"),
+            "leader_main_hand": data.get("leader_main_hand", "руки"),
         }
-    
     def _choose_emote(self, data: dict) -> int:
         """Выбрать эмоцию по контексту боя."""
         casualties = data.get("casualties", [])

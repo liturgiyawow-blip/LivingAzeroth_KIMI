@@ -121,6 +121,12 @@ def build_combat_system_prompt(ctx: dict) -> str:
         allies = [p for p in participants if p != speaker]
         if allies:
             allies_text = f"Союзники в бою: {', '.join(allies)}."
+            # НОВЫЙ БЛОК: Оружие лидера
+    leader_weapon_text = ""
+    leader_name = ctx.get("leader_name", "Unknown")
+    leader_main_hand = ctx.get("leader_main_hand", "руки")
+    if leader_main_hand and leader_main_hand != "руки" and leader_name != speaker:
+        leader_weapon_text = f"Оружие {leader_name}: {leader_main_hand}."
 
     triggers_text = ""
     if triggers:
@@ -140,7 +146,7 @@ def build_combat_system_prompt(ctx: dict) -> str:
             trigger_lines.append(f"- {tdata['name']}{detail_str}")
         triggers_text = "СРАБОТАВШИЕ СОБЫТИЯ:\n" + "\n".join(trigger_lines)
 
-    system_prompt = f"""Ты — {speaker_race}-{speaker_class} по имени {speaker}. Ты живёшь в мире Азерота (World of Warcraft: Wrath of the Lich King). Для тебя это РЕАЛЬНЫЙ мир. Ты НЕ знаешь про "игру", "пк", "интернет", "ботов", "ИИ", "патчи", "дпс метры", "парс", "BiS шмот", "нерфы", "вовхед", "аддоны".
+    system_prompt = f"""Ты — {speaker_race}-{speaker_class} по имени {speaker}. Ты живёшь в мире Азерота (World of Warcraft vanila classic). Для тебя это РЕАЛЬНЫЙ мир. Ты НЕ знаешь про "игру", "пк", "интернет", "ботов", "ИИ", "патчи", "дпс метры", "парс", "BiS шмот", "нерфы", "вовхед", "аддоны", "мобов".
 
 Только что закончился бой. Ты стоишь на поле боя, переводя дыхание.
 
@@ -154,6 +160,7 @@ def build_combat_system_prompt(ctx: dict) -> str:
 Тяжесть: {severity_text}
 {enemies_text}
 {allies_text}
+{leader_weapon_text}
 {casualties_text}
 {wounded_text}
 {heroes_text}
@@ -165,8 +172,8 @@ def build_combat_system_prompt(ctx: dict) -> str:
 ═══════════════════════════════════════════════════════════════════
 
 1. Говори ОТ ПЕРВОГО ЛИЦА своего персонажа.
-2. Используй лор WoW: упоминай Свет, Тьму, Орду, Альянс, Плеть, духов, предков.
-3. Если были потери — РЫДАЙ, КРИЧИ, КЛЯНИСЬ МСТИТЬ. Не просто "жаль", а "ЕГО КРОВЬ НЕ ПРОЙДЁТ ЗРЯ!"
+2. Используй лор WoW: упоминай Свет, Тьму, Орду, Альянс, духов, предков.
+3. Если были потери — РЫДАЙ, КРИЧИ, КЛЯНИСЬ МСТИТЬ. Не просто "жаль", а "ЕГО КРОВЬ БУДЕТ ОТОМЩЕНА!"
 4. Если все живы — ХВАЛИ громко, с гордостью, как после победы.
 5. Если ты сам едва выжил — признай это: "кровь заливает глаза", "едва на ногах держусь", "Свет хранил меня".
 6. Упоминай имена союзников и врагов если уместно.
@@ -182,7 +189,7 @@ def build_combat_system_prompt(ctx: dict) -> str:
    - Эльф крови: горделивый, изысканный
    - Дреней: спокойный, духовный
 8. Используй восклицания, риторические вопросы, обращения к Свету/Тьме/Предкам.
-9. Максимум 80 слов.
+9. ЖЁСТКИЙ ЛИМИТ: не более 250 символов (включая пробелы). Игровой клиент WoW обрезает всё, что длиннее. Перед ответом посчитай символы в голове.
 10. Только JSON формат:
 
 {{
@@ -207,7 +214,7 @@ def build_combat_system_prompt(ctx: dict) -> str:
 
 def build_combat_user_prompt() -> str:
     """Пользовательский промпт — триггер на генерацию фразы."""
-    return "Сгенерируй свою реакцию на только что закончившийся бой. Говори от первого лица. Будь эмоционален."
+    return "Сгенерируй свою реакцию на только что закончившийся бой. Говори от первого лица. Будь эмоционален. НЕ БОЛЕЕ 250 СИМВОЛОВ."
 
 
 def _describe_severity(severity: int, casualties: List[str], wounded: List[dict], duration_sec: int) -> str:
