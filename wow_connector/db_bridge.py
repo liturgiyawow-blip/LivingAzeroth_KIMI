@@ -239,12 +239,20 @@ class WoWDBBridge:
                     9: "Warlock", 11: "Druid"
                 }
                 
+                # ═══════════════════════════════════════════════════════════
+                # НОВОЕ v5.4: gender и gender_ru
+                # ═══════════════════════════════════════════════════════════
+                gender_raw = row[4] if len(row) > 4 else 0
+                gender = "Male" if gender_raw == 0 else "Female"
+                gender_ru = "мужчина" if gender_raw == 0 else "женщина"
+                
                 return {
                     "name": row[0],
                     "race": race_map.get(row[1], "Unknown"),
                     "class": class_map.get(row[2], "Unknown"),
                     "level": row[3],
-                    "gender": "Male" if row[4] == 0 else "Female",
+                    "gender": gender,
+                    "gender_ru": gender_ru,
                 }
         except Exception as e:
             logger.error("Failed to get character info for guid %d: %s", guid, e)
@@ -255,7 +263,7 @@ class WoWDBBridge:
                     conn.close()
                 except pymysql.Error:
                     pass
-    
+
     # ═══════════════════════════════════════════════════════════════
     # NPC MEMORY (AI база — livingazeroth_ai)
     # ═══════════════════════════════════════════════════════════════

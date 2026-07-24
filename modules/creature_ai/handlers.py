@@ -147,11 +147,20 @@ class CreatureAIHandler:
         ctx = self.world.get_full_context(str(npc_guid))
         entity_data = ctx.get("npc", {})
         
+        # ═══════════════════════════════════════════════════════════
+        # НОВОЕ v5.4: добавляем gender игрока
+        # ═══════════════════════════════════════════════════════════
+        player_char_info = self.db.get_character_info(player_guid)
+        player_gender = player_char_info.get("gender", "Male") if player_char_info else "Male"
+        player_gender_ru = player_char_info.get("gender_ru", "мужчина") if player_char_info else "мужчина"
+        
         player_data = {
             "name": player_name,
             "guid": player_guid,
             "race": "Unknown",
             "class": "Unknown",
+            "gender": player_gender,
+            "gender_ru": player_gender_ru,
             "reputation": entity_data.get("reputation_to_player", 0),
             "memory": db_memory,
         }
@@ -312,6 +321,12 @@ class CreatureAIHandler:
                     speech_style = self._get_speech_style(race, class_name)
                     faction = self._get_faction_by_race(race)
                     
+                    # ═══════════════════════════════════════════════════════════
+                    # НОВОЕ v5.4: gender из character_info
+                    # ═══════════════════════════════════════════════════════════
+                    gender = char_info.get("gender", "Male")
+                    gender_ru = char_info.get("gender_ru", "мужчина")
+                    
                     default_data = {
                         "name": name,
                         "guid": guid,
@@ -320,6 +335,8 @@ class CreatureAIHandler:
                         "race": race,
                         "class": class_name,
                         "level": level,
+                        "gender": gender,
+                        "gender_ru": gender_ru,
                         "role": role,
                         "trait": trait,
                         "mood": "нейтральный",

@@ -115,6 +115,8 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
     bot_faction = bot_profile.get("faction", "Нейтральная")
     bot_mood = bot_profile.get("mood", "нейтральный")
     speech_style = bot_profile.get("speech_style", "Обычный")
+    bot_gender = bot_profile.get("gender", "Male")
+    bot_gender_ru = bot_profile.get("gender_ru", "мужчина")
     
     # Память бота
     memory_list = bot_profile.get("memory", [])
@@ -130,7 +132,8 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
     hour = world_context.get("meta", {}).get("world_hour", 12)
     
     # Данные игрока
-    player_name = player_data.get("name", "Командир")
+    player_name = player_data.get("name", "Предводитель")
+    player_gender = player_data.get("gender_ru", "мужчина")
     player_rep = player_data.get("reputation", 0)
     rep_desc = _rep_to_text(player_rep)
     
@@ -156,6 +159,7 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
 ЧЕРТЫ: {bot_trait}
 ФРАКЦИЯ: {bot_faction}
 НАСТРОЕНИЕ: {bot_mood}
+ПОЛ: {bot_gender_ru}
 
 СТИЛЬ РЕЧИ: {speech_style}
 
@@ -174,6 +178,7 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
 ═══════════════════════════════════════════════════════════════════
 
 ИМЯ ЛИДЕРА: {player_name}
+ПОЛ ЛИДЕРА: {player_gender}
 РЕПУТАЦИЯ С ТОБОЙ: {player_rep} ({rep_desc})
 
 ВАЖНО: Если лидер говорит "меня", "моё имя", "мне", "я" — он имеет в виду СЕБЯ, {player_name}.
@@ -193,8 +198,13 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
 5. ПОМНИ ИСТОРИЮ ДИАЛОГОВ — развивай тему, не повторяй одно и то же.
 6. Если лидер спрашивает про тебя — рассказывай о себе (раса, класс, родина).
 7. Если лидер спрашивает про себя — отвечай про него, используя его имя {player_name}.
-8. ЖЁСТКИЙ ЛИМИТ: не более 250 символов (включая пробелы). Игровой клиент WoW обрезает всё длиннее.
-9. Только JSON:
+8. УЧИТЫВАЙ ПОЛ. Ты — {bot_gender_ru}. Лидер — {player_gender}.
+    - Если ты женщина — не используй "братаны", "мужики", "парни" о себе.
+    - Если лидер женщина — не обращайся к ней "братан", "мужик", "парень".
+    - Если в группе есть женщины — используй "друзья", "соратники", "братья и сёстры", придумай синонимы или обращайся по имени.
+    - НЕ предполагай пол по классу или расе. Орк-женщина — не "братан". Гномка — не "мужик".
+9. ЖЁСТКИЙ ЛИМИТ: не более 250 символов (включая пробелы). Игровой клиент WoW обрезает всё длиннее.
+10. Только JSON:
 
 {{
   "speech": "текст реплики",

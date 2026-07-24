@@ -4,7 +4,7 @@ if _G.LivingAzerothLoaded then
 end
 _G.LivingAzerothLoaded = true
 
-print("[LivingAzeroth] === FILE LOADING v5.3 ===")
+print("[LivingAzeroth] === FILE LOADING v5.4-fix ===")
 
 -- ============================================
 -- JSON БИБЛИОТЕКА
@@ -49,6 +49,18 @@ end
 local function EscapeSQL(str)
     if not str then return "" end
     return tostring(str):gsub("\0", ""):gsub("'", "''"):gsub("\\", "\\\\")
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- НОВОЕ v5.4-fix: ЗАЩИТА ОТ NAN В POWER PCT
+-- ═══════════════════════════════════════════════════════════════
+local function SafePowerPct(unit)
+    local ok, val = pcall(function() return unit:GetPowerPct(0) end)
+    if not ok or val ~= val then
+        -- nan ~= nan = true. Для воинов/разбойников (ярость/энергия) возвращаем 100
+        return 100
+    end
+    return val
 end
 
 -- ============================================
@@ -495,8 +507,6 @@ local function GetWeaponName(unit)
     local unitName = "Unknown"
     pcall(function() unitName = unit:GetName() end)
     
-    -- В разных сборках AzerothCore слоты отличаются.
-    -- Проверяем 15, 16, 17 — первый найденный = оружие.
     local methods = {
         { name = "Slot15", fn = function() return unit:GetEquippedItemBySlot(15) end },
         { name = "Slot16", fn = function() return unit:GetEquippedItemBySlot(16) end },
@@ -520,7 +530,7 @@ end
 
 
 -- ============================================
--- COMBAT: ENTER COMBAT v5.3-fix2
+-- COMBAT: ENTER COMBAT v5.4-fix
 -- ============================================
 
 local function OnEnterCombat(event, player, enemy)
@@ -535,12 +545,8 @@ local function OnEnterCombat(event, player, enemy)
         return
     end
     
-    -- ═══════════════════════════════════════════════════════════════
-    -- FIX v5.3-fix2: Тройной fallback для имени врага
-    -- ═══════════════════════════════════════════════════════════════
     local enemyName = "неизвестный враг"
     
-    -- Попытка 1: аргумент события
     if enemy then
         local ok, name = pcall(function() return enemy:GetName() end)
         if ok and name and name ~= "" then
@@ -548,7 +554,6 @@ local function OnEnterCombat(event, player, enemy)
         end
     end
     
-    -- Попытка 2: текущая цель игрока (victim)
     if enemyName == "неизвестный враг" then
         local ok, victim = pcall(function() return player:GetVictim() end)
         if ok and victim then
@@ -560,7 +565,6 @@ local function OnEnterCombat(event, player, enemy)
         end
     end
     
-    -- Попытка 3: выделенная цель (selection)
     if enemyName == "неизвестный враг" then
         local ok, selection = pcall(function() return player:GetSelection() end)
         if ok and selection then
@@ -576,10 +580,12 @@ local function OnEnterCombat(event, player, enemy)
     
     local participants = {}
     
-    -- Игрок (лидер)
     local okHp, hpStart = pcall(function() return player:GetHealthPct() end)
     local okMaxHp, maxHp = pcall(function() return player:GetMaxHealth() end)
-    local okMana, manaStart = pcall(function() return player:GetPowerPct(0) end)
+    -- ═══════════════════════════════════════════════════════════════
+    -- НОВОЕ v5.4-fix: SafePowerPct вместо GetPowerPct(0)
+    -- ═══════════════════════════════════════════════════════════════
+    local manaStart = SafePowerPct(player)
     local okClass, className = pcall(function() return player:GetClassAsString() end)
     local okRace, raceName = pcall(function() return player:GetRaceAsString() end)
     
@@ -590,13 +596,12 @@ local function OnEnterCombat(event, player, enemy)
         race = okRace and raceName or "Unknown",
         hp_start = okHp and hpStart or 100,
         max_hp = okMaxHp and maxHp or 1000,
-        mana_start = okMana and manaStart or 100,
+        mana_start = manaStart,
         deaths = 0,
         is_player = true,
         main_hand = GetWeaponName(player),
     })
     
-    -- Боты
     local members = group:GetMembers()
     for _, member in ipairs(members) do
         if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
@@ -604,7 +609,10 @@ local function OnEnterCombat(event, player, enemy)
             if ok and isBotMember then
                 local okHp2, hpStart2 = pcall(function() return member:GetHealthPct() end)
                 local okMaxHp2, maxHp2 = pcall(function() return member:GetMaxHealth() end)
-                local okMana2, manaStart2 = pcall(function() return member:GetPowerPct(0) end)
+                -- ═══════════════════════════════════════════════════════════════
+                -- НОВОЕ v5.4-fix: SafePowerPct для ботов тоже
+                -- ═══════════════════════════════════════════════════════════════
+                local manaStart2 = SafePowerPct(member)
                 local okClass2, className2 = pcall(function() return member:GetClassAsString() end)
                 local okRace2, raceName2 = pcall(function() return member:GetRaceAsString() end)
                 
@@ -615,7 +623,7 @@ local function OnEnterCombat(event, player, enemy)
                     race = okRace2 and raceName2 or "Unknown",
                     hp_start = okHp2 and hpStart2 or 100,
                     max_hp = okMaxHp2 and maxHp2 or 1000,
-                    mana_start = okMana2 and manaStart2 or 100,
+                    mana_start = manaStart2,
                     deaths = 0,
                     is_player = false,
                     main_hand = GetWeaponName(member),
@@ -647,6 +655,62 @@ local function OnEnterCombat(event, player, enemy)
 end
 
 
+-- ═══════════════════════════════════════════════════════════════
+-- НОВОЕ v5.4-fix: ТАБЛИЦА ИЗВЕСТНЫХ БОССОВ
+-- ═══════════════════════════════════════════════════════════════
+local KNOWN_BOSSES = {
+    -- Razorfen Kraul
+    ["Aggem Thorncurse"] = true,
+    ["Death Speaker Jargba"] = true,
+    ["Overlord Ramtusk"] = true,
+    ["Agathelos the Raging"] = true,
+    ["Blind Hunter"] = true,
+    ["Charlga Razorflank"] = true,
+    -- Добавляй сюда боссов других инстансов
+}
+
+-- ═══════════════════════════════════════════════════════════════
+-- НОВОЕ v5.4-fix: УМНОЕ ОПРЕДЕЛЕНИЕ БОССА
+-- ═══════════════════════════════════════════════════════════════
+local function IsBoss(killed, enemyName)
+    local isBoss = false
+    local bossReason = ""
+    
+    -- Проверка 1: rank
+    local okRank, rank = pcall(function() return killed:GetRank() end)
+    if okRank then
+        if rank >= 3 then
+            isBoss = true
+            bossReason = "rank=" .. rank
+        elseif rank >= 2 then
+            isBoss = true
+            bossReason = "rank=" .. rank .. " (rare elite)"
+        end
+    end
+    
+    -- Проверка 2: HP (ниже порог для инстансовых боссов)
+    local okHp, maxHp = pcall(function() return killed:GetMaxHealth() end)
+    if okHp and maxHp then
+        if maxHp > COMBAT_CONFIG.THRESHOLD_BOSS_HP then
+            isBoss = true
+            bossReason = bossReason .. " hp=" .. maxHp
+        elseif maxHp > 30000 and not isBoss then
+            -- Средний HP в инсте = возможно босс
+            isBoss = true
+            bossReason = "hp=" .. maxHp .. " (instance boss)"
+        end
+    end
+    
+    -- Проверка 3: известные имена
+    if KNOWN_BOSSES[enemyName] then
+        isBoss = true
+        bossReason = "known boss name"
+    end
+    
+    return isBoss, bossReason
+end
+
+
 local function OnKillCreature(event, player, killed)
     local guid = player:GetGUIDLow()
     local session = combatSessions[guid]
@@ -656,16 +720,19 @@ local function OnKillCreature(event, player, killed)
     if not ok or not enemyName then enemyName = "неизвестный враг" end
     table.insert(session.enemies, enemyName)
     
-    local okRank, rank = pcall(function() return killed:GetRank() end)
-    local okHp, maxHp = pcall(function() return killed:GetMaxHealth() end)
-    if (okRank and rank >= COMBAT_CONFIG.THRESHOLD_BOSS_RANK) or (okHp and maxHp > COMBAT_CONFIG.THRESHOLD_BOSS_HP) then
+    -- ═══════════════════════════════════════════════════════════════
+    -- НОВОЕ v5.4-fix: ИСПОЛЬЗУЕМ УМНОЕ ОПРЕДЕЛЕНИЕ БОССА
+    -- ═══════════════════════════════════════════════════════════════
+    local isBoss, bossReason = IsBoss(killed, enemyName)
+    if isBoss then
         session.boss_killed = true
         session.boss_name = enemyName
+        Log("[CombatDebug] BOSS DETECTED: " .. enemyName .. " (" .. bossReason .. ")")
     end
 end
 
 -- ============================================
--- COMBAT: LEAVE COMBAT v5.3-fix
+-- COMBAT: LEAVE COMBAT v5.4
 -- ============================================
 
 local function OnLeaveCombat(event, player)
@@ -689,13 +756,11 @@ local function OnLeaveCombat(event, player)
     session.end_time = os.time()
     session.duration = session.end_time - session.start_time
 
-    -- Логируем raw enemies
     Log(string.format("[CombatDebug] LeaveCombat: raw enemies count=%d", #(session.enemies or {})))
     for i, name in ipairs(session.enemies or {}) do
         Log(string.format("[CombatDebug]   raw[%d] = %s (type=%s)", i, tostring(name), type(name)))
     end
     
-    -- Дедупликация
     local uniqueEnemies = {}
     local enemySeen = {}
     for _, name in ipairs(session.enemies or {}) do
@@ -728,37 +793,45 @@ local function OnLeaveCombat(event, player)
         Log(string.format("[CombatDebug]   unique[%d] = %s", i, tostring(name)))
     end
     
-    -- FIX: защита от nil для всех участников
     for _, p in ipairs(session.participants or {}) do
         local member = FindPlayerByGUIDLow(p.guid)
         if member then
             local okHp, hpEnd = pcall(function() return member:GetHealthPct() end)
-            local okMana, manaEnd = pcall(function() return member:GetPowerPct(0) end)
+            -- ═══════════════════════════════════════════════════════════════
+            -- НОВОЕ v5.4-fix: SafePowerPct вместо GetPowerPct(0)
+            -- ═══════════════════════════════════════════════════════════════
+            local manaEnd = SafePowerPct(member)
             p.hp_end = (okHp and hpEnd) or 0
-            p.mana_end = (okMana and manaEnd) or 0
+            p.mana_end = manaEnd
         else
             p.hp_end = p.hp_end or 0
-            p.mana_end = p.mana_end or 0
+            p.mana_end = p.mana_end or 100
         end
     end
     
     Log("=== COMBAT PARTICIPANTS FINAL STATE ===")
     for _, p in ipairs(session.participants or {}) do
         local hpLost = (p.hp_start or 100) - (p.hp_end or 0)
-        local manaLost = (p.mana_start or 100) - (p.mana_end or 0)
-        -- FIX: защита string.format от nil
+        local manaLost = (p.mana_start or 100) - (p.mana_end or 100)
         Log(string.format("  %s (%s): hp=%.0f->%.0f (lost %.0f%%), mana=%.0f->%.0f (lost %.0f%%), deaths=%.0f, is_player=%s",
             tostring(p.name), tostring(p.class), 
             (p.hp_start or 0), (p.hp_end or 0), hpLost,
-            (p.mana_start or 0), (p.mana_end or 0), manaLost,
+            (p.mana_start or 100), (p.mana_end or 100), manaLost,
             (p.deaths or 0), tostring(p.is_player)))
     end
     
-    local severity, modifiers, triggers = EvaluateTriggers(session, session.participants)
+    local severity, modifiers, triggers, durMod = EvaluateTriggers(session, session.participants)
     
-    local finalChance = math.min(COMBAT_CONFIG.MAX_CHANCE, COMBAT_CONFIG.BASE_CHANCE_BOT + severity)
+    if not durMod then
+        durMod = { chance_bonus = 0, min_chance = 15, category = "unknown" }
+    end
     
-    -- Выбираем говорящего только среди БОТОВ
+    local baseChance = COMBAT_CONFIG.BASE_CHANCE_BOT + severity + durMod.chance_bonus
+    local finalChance = math.min(COMBAT_CONFIG.MAX_CHANCE, math.max(durMod.min_chance, baseChance))
+    
+    Log(string.format("[CombatDebug] Duration=%ds, category=%s, bonus=%d, min=%d, base=%d, final=%d%%",
+        session.duration, durMod.category, durMod.chance_bonus, durMod.min_chance, baseChance, finalChance))
+    
     local speaker = nil
     local aliveBots = {}
     for _, p in ipairs(session.participants or {}) do
@@ -777,7 +850,6 @@ local function OnLeaveCombat(event, player)
         return
     end
     
-    -- FIX: защита speaker
     if not speaker.guid or not speaker.name then
         Log("ERROR: selected speaker is invalid")
         combatSessions[guid] = nil
@@ -785,7 +857,7 @@ local function OnLeaveCombat(event, player)
     end
     
     local roll = math.random(1, 100)
-    Log("Combat ended. Chance: " .. finalChance .. "%, rolled: " .. roll .. " (severity=" .. severity .. ")")
+    Log("Combat ended. Chance: " .. finalChance .. "%, rolled: " .. roll .. " (severity=" .. severity .. ", duration=" .. session.duration .. "s)")
     
     if roll > finalChance then
         Log("No post-combat phrase (roll failed)")
@@ -793,7 +865,6 @@ local function OnLeaveCombat(event, player)
         return
     end
     
-    -- FIX: leader_main_hand из первого участника (игрок)
     local leaderMainHand = "руки"
     if session.participants and session.participants[1] and session.participants[1].main_hand then
         leaderMainHand = session.participants[1].main_hand
@@ -809,6 +880,7 @@ local function OnLeaveCombat(event, player)
         speaker_race = speaker.race or "Unknown",
         duration_desc = DescribeDuration(session.duration),
         duration_sec = session.duration,
+        duration_category = durMod.category,
         severity = severity,
         modifiers = modifiers,
         triggers = triggers,
@@ -846,6 +918,7 @@ local function OnLeaveCombat(event, player)
     local jsonData = json.encode(rpData)
     
     Log("[CombatDebug] JSON enemies_names in payload: " .. tostring(#uniqueEnemies))
+    Log("[CombatDebug] JSON duration_category: " .. tostring(durMod.category))
     Log("[CombatDebug] JSON first 800 chars: " .. tostring(jsonData):sub(1, 800))
     
     local sql = string.format(
@@ -890,9 +963,9 @@ RegisterPlayerEvent(33, OnEnterCombat)
 RegisterPlayerEvent(34, OnLeaveCombat)
 RegisterPlayerEvent(7, OnKillCreature)
 
-Log("Living Azeroth [v5.3] loaded!")
+Log("Living Azeroth [v5.4-fix] loaded!")
 Log("NPC prefix: '" .. AI_WORLD.NPC_PREFIX .. "'")
-Log("CombatAnalyst: modular triggers, MAX_CHANCE=" .. COMBAT_CONFIG.MAX_CHANCE .. "%")
+Log("CombatAnalyst: modular triggers, DURATION_MODIFIERS, SMART_BOSS_DETECT, SafePowerPct")
 
 CreateLuaEvent(GlobalPollLoop, 1000, 0)
 Log("GlobalPollLoop started (1000ms)")
