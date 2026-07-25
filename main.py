@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from flask import Flask, request, jsonify
-
+from core.db_cleanup import DatabaseCleaner
 import config
 from core.world_state import WorldState
 from core.llm_queue import PriorityLLMQueue
@@ -77,6 +77,17 @@ else:
 # Запуск DB Bridge (начать polling MySQL)
 db_bridge.start()
 
+# ═══════════════════════════════════════════════════════════════════
+# DATABASE CLEANUP — автоматическая очистка старых записей
+# ═══════════════════════════════════════════════════════════════════
+db_cleaner = DatabaseCleaner(
+    cleanup_interval_hours=24,
+    retention_days_requests=7,    # Храним диалоги неделю
+    retention_days_memory=5,     # Память дней
+    cleanup_memory=False          # Пока НЕ удаляем память, только запросы
+)
+db_cleaner.start()
+
 # ─── ЭНДПОИНТЫ ───
 
 @app.route("/health")
@@ -134,4 +145,5 @@ if __name__ == "__main__":
         db_bridge.shutdown()
         llm_queue.shutdown()
         world_state.shutdown()
+        db_cleaner.shutdown()
         logger.info("Goodbye")

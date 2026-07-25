@@ -24,14 +24,14 @@ end
 -- КОНФИГУРАЦИЯ ШАНСОВ И ПОРОГОВ
 -- ═══════════════════════════════════════════════════════════════
 _G.COMBAT_CONFIG = {
-    BASE_CHANCE_BOT = 30,
+    BASE_CHANCE_BOT = 33,
     MAX_CHANCE = 100,
     
     THRESHOLD_WOUNDED_HP_LOST = 30,
     THRESHOLD_CRITICAL_HP_LOST = 60,
     THRESHOLD_HERO_HP_LOST = 50,
     THRESHOLD_LONG_FIGHT_SEC = 180,
-    THRESHOLD_BOSS_HP = 100000,
+    THRESHOLD_BOSS_HP = 10000,
     THRESHOLD_BOSS_RANK = 2,
     
     THRESHOLD_HEALER_MANA_LOST = 70,
@@ -42,12 +42,12 @@ _G.COMBAT_CONFIG = {
     -- Чем короче бой — тем меньше шанс реплики и проще фразы
     -- ═══════════════════════════════════════════════════════════
     DURATION_MODIFIERS = {
-        { max_sec = 5,    chance_bonus = -20, min_chance = 10,  category = "instant" },
-        { max_sec = 10,   chance_bonus = -5, min_chance = 10, category = "quick" },
-        { max_sec = 20,   chance_bonus = 0,   min_chance = 15, category = "short" },
-        { max_sec = 60,  chance_bonus = 10,  min_chance = 45, category = "medium" },
-        { max_sec = 300,  chance_bonus = 25,  min_chance = 60, category = "long" },
-        { max_sec = 9999, chance_bonus = 40,  min_chance = 75, category = "epic" },
+        { max_sec = 2,    chance_bonus = -20, min_chance = 10,  category = "instant" },
+        { max_sec = 5,   chance_bonus = -5, min_chance = 10, category = "quick" },
+        { max_sec = 10,   chance_bonus = 0,   min_chance = 15, category = "short" },
+        { max_sec = 30,  chance_bonus = 10,  min_chance = 45, category = "medium" },
+        { max_sec = 60,  chance_bonus = 25,  min_chance = 60, category = "long" },
+        { max_sec = 180, chance_bonus = 40,  min_chance = 75, category = "epic" },
     },
 }
 

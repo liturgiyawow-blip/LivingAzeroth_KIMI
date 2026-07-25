@@ -20,7 +20,7 @@ local AI_WORLD = {
     FIND_RADIUS   = 100,
     NPC_PREFIX = "№",
     DEBUG = true,
-    BOT_REPLY_TO_BOT_CHANCE = 5,
+    BOT_REPLY_TO_BOT_CHANCE = 7,
 }
 
 -- ============================================
@@ -151,6 +151,17 @@ end
 local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targetIsPlayer, targetName)
     local player = FindPlayerByGUIDLow(playerGuid)
     if not player then
+        -- Игрок не в сети — помечаем ответ как "доставлено вникуда", иначе он вылезет позже не к месту
+        local sql = string.format(
+            "SELECT id FROM ai_responses WHERE player_guid = %u AND npc_guid = %u AND fetched = 0 ORDER BY created_at DESC LIMIT 1",
+            playerGuid, targetGuid
+        )
+        local query = CharDBQuery(sql)
+        if query then
+            local rowId = query:GetUInt32(0)
+            CharDBExecute("UPDATE ai_responses SET fetched = 1, delivered_at = UNIX_TIMESTAMP() WHERE id = " .. rowId)
+            Log(string.format("[AI] Player %s offline, marked response id=%d as fetched (orphan cleanup)", playerName or "?", rowId))
+        end
         return true
     end
     
@@ -219,6 +230,17 @@ local function GlobalPollLoop()
             if data.retries > 60 then
                 local p = FindPlayerByGUIDLow(data.playerGuid)
                 if p then p:SendBroadcastMessage("|cffff0000[AI]|r Response timeout.") end
+                -- ═══════════════════════════════════════════════════════════════
+                -- ЗАЩИТА: помечаем висящий ответ как fetched, иначе он вылезет позже
+                -- ═══════════════════════════════════════════════════════════════
+                local sql = string.format(
+                    "UPDATE ai_responses SET fetched = 1, delivered_at = UNIX_TIMESTAMP() WHERE player_guid = %u AND npc_guid = %u AND fetched = 0",
+                    data.playerGuid, data.targetGuid
+                )
+                local ok = pcall(function() CharDBExecute(sql) end)
+                if ok then
+                    Log(string.format("[AI] Timeout cleanup: marked responses fetched for player=%u npc=%u", data.playerGuid, data.targetGuid))
+                end
                 pendingChecks[key] = nil
             end
         end
@@ -499,6 +521,13 @@ end
 
 local combatSessions = {}
 
+-- ═══════════════════════════════════════════════════════════════
+-- DEBOUNCE: не чаще 1 POST-COMBAT фразы в N секунд
+-- ═══════════════════════════════════════════════════════════════
+local lastPostCombatTime = {}
+local POST_COMBAT_DEBOUNCE_SEC = 30   -- не чаще раза в 30 секунд
+local MIN_COMBAT_DURATION_SEC = 3     -- игнорировать мгновенные дребезги
+
 -- ============================================
 -- COMBAT: WEAPON DETECTION v5.3-fix2
 -- ============================================
@@ -751,7 +780,27 @@ local function OnLeaveCombat(event, player)
     if not session.active then
         return
     end
-    
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- ЗАЩИТА ОТ ДРЕБЕЗГА COMBAT-СТАТУСА В ЯДРЕ
+    -- ═══════════════════════════════════════════════════════════════
+    local now = os.time()
+    if lastPostCombatTime[guid] and (now - lastPostCombatTime[guid]) < POST_COMBAT_DEBOUNCE_SEC then
+        Log(string.format("[CombatDebug] OnLeaveCombat DEBOUNCED for %s (last=%d, now=%d, diff=%d)",
+            player:GetName(), lastPostCombatTime[guid], now, now - lastPostCombatTime[guid]))
+        combatSessions[guid] = nil
+        return
+    end
+
+    -- Игнорировать слишком короткие столкновения (дребезг агра)
+    local combatDuration = now - session.start_time
+    if combatDuration < MIN_COMBAT_DURATION_SEC then
+        Log(string.format("[CombatDebug] Combat too short (%ds < %ds), skipping post-combat for %s",
+            combatDuration, MIN_COMBAT_DURATION_SEC, player:GetName()))
+        combatSessions[guid] = nil
+        return
+    end
+
     session.active = false
     session.end_time = os.time()
     session.duration = session.end_time - session.start_time
@@ -952,6 +1001,7 @@ local function OnLeaveCombat(event, player)
         Log("SQL ERROR (post-combat): " .. tostring(err))
     end
     
+    lastPostCombatTime[guid] = os.time()
     combatSessions[guid] = nil
 end
 
