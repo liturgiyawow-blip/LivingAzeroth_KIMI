@@ -15,6 +15,19 @@ from typing import Dict, List
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════
+# ПОДГРУЗКА LIVING PERSONA ДЛЯ COMBAT
+# ═══════════════════════════════════════════════════════════════════
+try:
+    from modules.creature_ai.persona_loader import get_persona_loader
+    _persona = get_persona_loader().get_persona("roleplayers")
+    LIVING_ADDENDUM = _persona.get("system_prompt_addendum", "")
+    VOICE_EXAMPLES = _persona.get("voice_examples", [])
+except Exception as e:
+    logger.warning("Failed to load persona for combat: %s", e)
+    LIVING_ADDENDUM = ""
+    VOICE_EXAMPLES = []
+    
+# ═══════════════════════════════════════════════════════════════════
 # ЛОГИРОВАНИЕ ПРОМПТОВ ДЛЯ ОТЛАДКИ (ротация: 5 последних)
 # ═══════════════════════════════════════════════════════════════════
 

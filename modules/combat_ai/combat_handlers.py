@@ -19,6 +19,7 @@ from wow_connector.db_bridge import WoWDBBridge
 from modules.combat_ai import combat_prompts
 
 logger = logging.getLogger(__name__)
+prompt_logger = logging.getLogger("llm_prompts")
 
 
 class CombatAnalyst:
@@ -67,6 +68,19 @@ class CombatAnalyst:
         
         system_prompt = combat_prompts.build_combat_system_prompt(context)
         user_prompt = combat_prompts.build_combat_user_prompt()
+        # ═══════════════════════════════════════════════════════════════
+        # ЛОГИРОВАНИЕ COMBAT-ПРОМПТА
+        # ═══════════════════════════════════════════════════════════════
+        prompt_logger.debug(
+            f"[COMBAT] Speaker={speaker_name} (guid={speaker_guid}) | "
+            f"Leader={data.get('leader_name', 'Unknown')} (guid={leader_guid})\n"
+            f"Enemies={context.get('enemies_names', [])} | "
+            f"Duration={context.get('duration_desc', '?')} ({context.get('duration_sec', 0)}s) | "
+            f"Severity={context.get('severity', 0)} | Category={context.get('duration_category', '?')}\n"
+            f"--- SYSTEM PROMPT ---\n{system_prompt}\n"
+            f"--- USER PROMPT ---\n{user_prompt}\n"
+            f"--- END ---"
+        )
         
         # FIX v5.3: Увеличили токены для длинных фраз
         future = self.llm.submit(
@@ -111,6 +125,19 @@ class CombatAnalyst:
         
         logger.info("Writing response: player_guid=%d (leader), npc_guid=%d (speaker), text='%s...'",
                    leader_guid, speaker_guid, speech[:50])
+
+        # ═══════════════════════════════════════════════════════════════
+        # ЛОГИРОВАНИЕ COMBAT-ОТВЕТА
+        # ═══════════════════════════════════════════════════════════════
+        raw_content = result.get("speech", str(result)) if isinstance(result, dict) else str(result)
+        prompt_logger.debug(
+            f"[COMBAT] Speaker={speaker_name} (guid={speaker_guid}) | RESPONSE\n"
+            f"--- RAW LLM OUTPUT ---\n{raw_content[:2000]}\n"
+            f"--- VALIDATED ---\n"
+            f"speech={speech[:200]}\n"
+            f"emote={emote_id}\n"
+            f"--- END ---"
+        )
         
         self.db.write_response(
             player_guid=leader_guid,
@@ -150,6 +177,8 @@ class CombatAnalyst:
             for name in data.get("heroes", []):
                 seen.add(name)
             participants = list(seen)
+
+
         
         return {
             "speaker_name": data.get("speaker_name", "Unknown"),
