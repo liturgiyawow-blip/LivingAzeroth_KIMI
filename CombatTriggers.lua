@@ -24,7 +24,7 @@ end
 -- КОНФИГУРАЦИЯ ШАНСОВ И ПОРОГОВ
 -- ═══════════════════════════════════════════════════════════════
 _G.COMBAT_CONFIG = {
-    BASE_CHANCE_BOT = 33,
+    BASE_CHANCE_BOT = 63,
     MAX_CHANCE = 100,
     
     THRESHOLD_WOUNDED_HP_LOST = 30,
