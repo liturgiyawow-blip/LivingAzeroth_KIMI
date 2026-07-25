@@ -10,6 +10,7 @@ venv/
 .venv/
 env/
 ENV/
+f5_tts_server/
 
 # === Логи (чтобы не забивать гит историей текстовых логов) ===
 logs/
@@ -38,3 +39,6 @@ Thumbs.db
 *.sublime-workspace
 
 AI_Tactics.lua
+start_livingazeroth.bat
+test_tts.py
+data/tts_refs/

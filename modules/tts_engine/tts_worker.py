@@ -64,7 +64,7 @@ class TTSWorker:
                 # Для ботов: npc_guid = bot_guid. Ищем в characters расу/пол.
                 sql = """
                     SELECT r.id, r.player_guid, r.npc_guid, r.npc_entry, 
-                           r.response_text, r.emote_id, r.channel_type
+                           r.response_text, r.emote_id
                     FROM ai_responses r
                     WHERE r.id > %s AND r.fetched = 1 AND (r.tts_played = 0 OR r.tts_played IS NULL)
                     ORDER BY r.id ASC
@@ -80,8 +80,7 @@ class TTSWorker:
                         "npc_guid": row[2],
                         "npc_entry": row[3],
                         "text": row[4],
-                        "emote_id": row[5],
-                        "channel": row[6] or "SAY",
+                        "emote_id": row[5],                        
                     })
                     if row[0] > self._last_id:
                         self._last_id = row[0]
@@ -122,42 +121,33 @@ class TTSWorker:
     def _play_tts(self, text: str, race: str, gender: str):
         """Сгенерировать и воспроизвести TTS."""
         try:
+            ref_path = get_voice_path(race, gender)
+            if not ref_path.exists():
+                logger.warning("Ref audio not found: %s, using fallback", ref_path)
+                self._play_tts_fallback(text, race, gender)
+                return
+
             if config.TTS_ENGINE == "f5_tts":
-                ref_path = get_voice_path(race, gender)
-                if not ref_path.exists():
-                    logger.warning("Ref audio not found: %s, using fallback", ref_path)
-                    ref_path = get_voice_path("Human", "Male")
-                
-                # F5-TTS API (пример, endpoint зависит от реализации сервера)
+                from modules.tts_engine.voice_map import get_ref_text
                 payload = {
                     "text": text,
                     "ref_audio": str(ref_path),
-                    "ref_text": "",  # Можно оставить пустым для F5-TTS
+                    "ref_text": get_ref_text(race, gender),
                 }
                 resp = requests.post(f"{config.TTS_API_URL}/inference", json=payload, timeout=30)
-                resp.raise_for_status()
-                audio_data = resp.content
-                
-            elif config.TTS_ENGINE == "gpt_sovits":
-                voice_id = get_voice_id(race, gender)
-                payload = {
-                    "text": text,
-                    "model_name": voice_id,
-                }
-                resp = requests.post(f"{config.TTS_API_URL}/tts", json=payload, timeout=30)
-                resp.raise_for_status()
-                audio_data = resp.content
+                if resp.status_code == 200:
+                    self._play_audio(resp.content)
+                    logger.info("F5-TTS played for %s %s: '%s...'", race, gender, text[:40])
+                    return
+                else:
+                    logger.warning("F5-TTS returned %d, falling back to pyttsx3", resp.status_code)
             
-            else:
-                logger.error("Unknown TTS engine: %s", config.TTS_ENGINE)
-                return
-            
-            # Воспроизведение
-            self._play_audio(audio_data)
-            logger.info("TTS played for %s %s: '%s...'", race, gender, text[:40])
+            # Fallback для любого другого движка или при ошибке F5-TTS
+            self._play_tts_fallback(text, race, gender)
             
         except Exception as e:
             logger.error("TTS failed: %s", e)
+            self._play_tts_fallback(text, race, gender)
     
     def _play_audio(self, audio_data: bytes):
         """Воспроизвести WAV-данные через локальные колонки."""
