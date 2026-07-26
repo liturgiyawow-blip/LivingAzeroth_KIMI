@@ -2,6 +2,13 @@ import os
 import io
 import uvicorn
 import torch
+# FIX for PyTorch 2.6+: XTTS models need weights_only=False
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
 import tempfile
 from fastapi import FastAPI
 from fastapi.responses import Response
@@ -10,7 +17,7 @@ from TTS.api import TTS
 
 app = FastAPI()
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
 print(f"[XTTS-v2] Loading model on {device}...")
 tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
 print("[XTTS-v2] Ready on http://localhost:5002")
@@ -32,10 +39,11 @@ async def inference(req: TTSRequest):
 
     try:
         tts.tts_to_file(
-            text=req.text,
-            speaker_wav=req.ref_audio,
-            language="ru",
-            file_path=tmp_path
+        text=req.text,
+        speaker_wav=req.ref_audio,
+        language="ru",
+        file_path=tmp_path,
+        #decoder_iterations=6  # БЫСТРЕЕ в 3-5 раз, качество чуть хуже но терпимо
         )
 
         with open(tmp_path, "rb") as f:
