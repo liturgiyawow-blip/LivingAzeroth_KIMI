@@ -1,7 +1,6 @@
 """
-TTS Worker — асинхронный озвучиватель ботов
+TTS Worker — XTTS v2 (клонирование голоса, русский)
 Запускается ОТДЕЛЬНО от main.py: python -m modules.tts_engine.tts_worker
-Можно убить Ctrl+C, main.py продолжит работать.
 """
 
 import logging
@@ -14,11 +13,10 @@ import requests
 import pymysql
 
 import config
-from modules.tts_engine.voice_map import get_voice_path, get_voice_id
+from modules.tts_engine.voice_map import get_voice_path, get_ref_text
 
 logger = logging.getLogger("tts_worker")
 
-# Проверка: включена ли озвучка
 if not getattr(config, 'TTS_ENABLED', False):
     logger.info("TTS is disabled in config. Exiting.")
     exit(0)
@@ -56,12 +54,9 @@ class TTSWorker:
             conn.close()
     
     def _fetch_new_responses(self):
-        """Получить новые ответы, которые ещё не озвучены."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                # Нам нужен npc_guid, чтобы определить голос
-                # Для ботов: npc_guid = bot_guid. Ищем в characters расу/пол.
                 sql = """
                     SELECT r.id, r.player_guid, r.npc_guid, r.npc_entry, 
                            r.response_text, r.emote_id
@@ -92,7 +87,6 @@ class TTSWorker:
             conn.close()
     
     def _get_bot_info(self, bot_guid: int) -> Optional[dict]:
-        """Получить расу/пол бота из characters."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
@@ -119,43 +113,39 @@ class TTSWorker:
             conn.close()
     
     def _play_tts(self, text: str, race: str, gender: str):
-        """Сгенерировать и воспроизвести TTS через GPT-SoVITS v2."""
+        """Сгенерировать и воспроизвести TTS через XTTS v2."""
         try:
             ref_path = get_voice_path(race, gender)
             if not ref_path.exists():
                 logger.error("Ref audio not found: %s", ref_path)
                 return
 
-            from modules.tts_engine.voice_map import get_ref_text
             ref_text = get_ref_text(race, gender)
             if not ref_text:
                 logger.error("Ref text empty for %s %s", race, gender)
                 return
 
-            # GPT-SoVITS v2 API format
+            # XTTS лучше с короткими фразами
+            if len(text) > 150:
+                text = text[:147] + "..."
+
             payload = {
                 "text": text,
-                "text_lang": "auto",      # <-- было "ru"
-                "ref_audio_path": str(ref_path.resolve()),
-                "prompt_text": ref_text,
-                "prompt_lang": "auto",    # <-- было "ru"
-                "media_type": "wav",
-                "streaming_mode": False,
+                "ref_audio": str(ref_path.resolve()),
+                "ref_text": ref_text,
             }
             
-            logger.debug("TTS payload: %s", payload)
-            
             resp = requests.post(
-            f"{config.TTS_API_URL}/tts",
-            json=payload,
-            timeout=60
+                f"{config.TTS_API_URL}/inference",
+                json=payload,
+                timeout=60
             )
 
             if resp.status_code == 200:
                 self._play_audio(resp.content)
-                logger.info("GPT-SoVITS v2 played for %s %s: '%s...'", race, gender, text[:40])
+                logger.info("XTTS v2 played for %s %s: '%s...'", race, gender, text[:40])
             else:
-                logger.error("GPT-SoVITS v2 returned %d: %s", resp.status_code, resp.text[:200])
+                logger.error("XTTS v2 returned %d: %s", resp.status_code, resp.text[:200])
 
         except Exception as e:
             logger.error("TTS failed: %s", e)
@@ -172,16 +162,12 @@ class TTSWorker:
                 sd.play(data, samplerate)
                 sd.wait()
         except ImportError:
-            # Fallback: сохранить файл
             out_path = config.LOGS_DIR / "last_tts.wav"
             with open(out_path, "wb") as f:
                 f.write(audio_data)
             logger.info("Audio saved to %s (install sounddevice+soundfile for playback)", out_path)
 
-
-
     def _mark_tts_played(self, response_id: int):
-        """Пометить, что озвучка выполнена."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
@@ -195,17 +181,15 @@ class TTSWorker:
             conn.close()
     
     def run(self):
-        logger.info("TTS Worker started. Engine: %s", config.TTS_ENGINE)
+        logger.info("TTS Worker started. Engine: xtts_v2")
         while self._running:
             try:
                 responses = self._fetch_new_responses()
                 for resp in responses:
-                    # Определяем голос по npc_guid (для ботов) или npc_entry (для NPC)
                     info = self._get_bot_info(resp["npc_guid"])
                     if info:
                         self._play_tts(resp["text"], info["race"], info["gender"])
                     else:
-                        # Fallback для NPC (пока Human Male)
                         self._play_tts(resp["text"], "Human", "Male")
                     
                     self._mark_tts_played(resp["id"])

@@ -2,11 +2,11 @@
 chcp 65001 >nul
 cd /d %~dp0
 
-echo [GPT-SoVITS] Starting TTS API server...
-start "GPT-SoVITS Server" cmd /k "cd /d C:\GPT-SoVITS && start_api.bat"
+echo [XTTS-v2] Starting TTS server on Python 3.10...
+start "XTTS-v2 Server" cmd /k "cd /d C:\Data\Games\1_Azeroth_Live\LivingAzeroth_KIMI\xtts_server && start_xtts.bat"
 
-echo Waiting for GPT-SoVITS to load (25 sec)...
-timeout /t 25 /nobreak >nul
+echo Waiting for XTTS-v2 to load (60 sec, first time downloads ~2GB)...
+timeout /t 60 /nobreak >nul
 
 echo [LivingAzeroth] Starting backend...
 start "LivingAzeroth Backend" cmd /k python main.py
@@ -21,6 +21,6 @@ echo ========================================
 echo All systems running.
 echo Close THIS window to stop TTS worker.
 echo Close Backend window to stop main.py.
-echo Close GPT-SoVITS window to stop TTS server.
+echo Close XTTS-v2 window to stop TTS server.
 echo ========================================
 pause

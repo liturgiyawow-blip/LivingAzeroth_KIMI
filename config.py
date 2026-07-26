@@ -36,8 +36,8 @@ MYSQL_DB_AI = "livingazeroth_ai"  # memory, reputation, profiles, quests
 
 # ─── TTS ───
 TTS_ENABLED = True
-TTS_ENGINE = "gpt_sovits"
-TTS_API_URL = "http://localhost:9880"
+TTS_ENGINE = "xtts_v2"
+TTS_API_URL = "http://localhost:5002"
 TTS_REF_DIR = BASE_DIR / "data" / "tts_refs"
 
 # ─── WORLD STATE ───
