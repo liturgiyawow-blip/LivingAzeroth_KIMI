@@ -119,36 +119,47 @@ class TTSWorker:
             conn.close()
     
     def _play_tts(self, text: str, race: str, gender: str):
-        """Сгенерировать и воспроизвести TTS."""
+        """Сгенерировать и воспроизвести TTS через GPT-SoVITS v2."""
         try:
             ref_path = get_voice_path(race, gender)
             if not ref_path.exists():
-                logger.warning("Ref audio not found: %s, using fallback", ref_path)
-                self._play_tts_fallback(text, race, gender)
+                logger.error("Ref audio not found: %s", ref_path)
                 return
 
-            if config.TTS_ENGINE == "f5_tts":
-                from modules.tts_engine.voice_map import get_ref_text
-                payload = {
-                    "text": text,
-                    "ref_audio": str(ref_path),
-                    "ref_text": get_ref_text(race, gender),
-                }
-                resp = requests.post(f"{config.TTS_API_URL}/inference", json=payload, timeout=30)
-                if resp.status_code == 200:
-                    self._play_audio(resp.content)
-                    logger.info("F5-TTS played for %s %s: '%s...'", race, gender, text[:40])
-                    return
-                else:
-                    logger.warning("F5-TTS returned %d, falling back to pyttsx3", resp.status_code)
+            from modules.tts_engine.voice_map import get_ref_text
+            ref_text = get_ref_text(race, gender)
+            if not ref_text:
+                logger.error("Ref text empty for %s %s", race, gender)
+                return
+
+            # GPT-SoVITS v2 API format
+            payload = {
+                "text": text,
+                "text_lang": "auto",      # <-- было "ru"
+                "ref_audio_path": str(ref_path.resolve()),
+                "prompt_text": ref_text,
+                "prompt_lang": "auto",    # <-- было "ru"
+                "media_type": "wav",
+                "streaming_mode": False,
+            }
             
-            # Fallback для любого другого движка или при ошибке F5-TTS
-            self._play_tts_fallback(text, race, gender)
+            logger.debug("TTS payload: %s", payload)
             
+            resp = requests.post(
+            f"{config.TTS_API_URL}/tts",
+            json=payload,
+            timeout=60
+            )
+
+            if resp.status_code == 200:
+                self._play_audio(resp.content)
+                logger.info("GPT-SoVITS v2 played for %s %s: '%s...'", race, gender, text[:40])
+            else:
+                logger.error("GPT-SoVITS v2 returned %d: %s", resp.status_code, resp.text[:200])
+
         except Exception as e:
             logger.error("TTS failed: %s", e)
-            self._play_tts_fallback(text, race, gender)
-    
+
     def _play_audio(self, audio_data: bytes):
         """Воспроизвести WAV-данные через локальные колонки."""
         try:
@@ -166,7 +177,9 @@ class TTSWorker:
             with open(out_path, "wb") as f:
                 f.write(audio_data)
             logger.info("Audio saved to %s (install sounddevice+soundfile for playback)", out_path)
-    
+
+
+
     def _mark_tts_played(self, response_id: int):
         """Пометить, что озвучка выполнена."""
         conn = self._get_conn()

@@ -35,10 +35,10 @@ MYSQL_DB_CHARACTERS = "acore_characters"  # ai_requests, ai_responses, character
 MYSQL_DB_AI = "livingazeroth_ai"  # memory, reputation, profiles, quests
 
 # ─── TTS ───
-TTS_ENABLED = True              # False = озвучка выключена, worker не нужен
-TTS_ENGINE = "f5_tts"           # "f5_tts" или "gpt_sovits"
-TTS_API_URL = "http://localhost:5001"  # API F5-TTS или GPT-SoVITS
-TTS_REF_DIR = BASE_DIR / "data" / "tts_refs"  # Папка с референсами/весами
+TTS_ENABLED = True
+TTS_ENGINE = "gpt_sovits"
+TTS_API_URL = "http://localhost:9880"
+TTS_REF_DIR = BASE_DIR / "data" / "tts_refs"
 
 # ─── WORLD STATE ───
 WORLD_STATE_FILE = DATA_DIR / "live_world_state.json"
