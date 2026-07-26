@@ -1,0 +1,3 @@
+cd C:\Data\Games\1_Azeroth_Live\LivingAzeroth_KIMI\xtts_server                               \venv\Scripts\python.exe api_server.py
+
+venv\Scripts\python.exe api_server.py

@@ -3,7 +3,7 @@ chcp 65001 >nul
 cd /d %~dp0
 
 echo [XTTS-v2] Starting TTS server on Python 3.10...
-start "XTTS-v2 Server" cmd /k "cd /d C:\Data\Games\1_Azeroth_Live\LivingAzeroth_KIMI\xtts_server && start_xtts.bat"
+start "XTTS-v2 Server" cmd /k "cd /d C:\Data\Games\1_Azeroth_Live\LivingAzeroth_KIMI\xtts_server>venv\Scripts\python.exe api_server.py"
 
 echo Waiting for XTTS-v2 to load (5 sec, first time downloads ~2GB)...
 timeout /t 5 /nobreak >nul

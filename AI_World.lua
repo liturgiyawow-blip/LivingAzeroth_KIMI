@@ -4,7 +4,7 @@ if _G.LivingAzerothLoaded then
 end
 _G.LivingAzerothLoaded = true
 
-print("[LivingAzeroth] === FILE LOADING v5.4-fix ===")
+print("[LivingAzeroth] === FILE LOADING v5.5-sync ===")
 
 -- ============================================
 -- JSON БИБЛИОТЕКА
@@ -146,7 +146,7 @@ local function WriteRequestToDB(player, target, message, channelType, targetIsPl
 end
 
 -- ============================================
--- DELIVER RESPONSE
+-- DELIVER RESPONSE  (v5.5-sync: ждём tts_played=1)
 -- ============================================
 local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targetIsPlayer, targetName)
     local player = FindPlayerByGUIDLow(playerGuid)
@@ -159,27 +159,29 @@ local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targe
         local query = CharDBQuery(sql)
         if query then
             local rowId = query:GetUInt32(0)
-            CharDBExecute("UPDATE ai_responses SET fetched = 1, delivered_at = UNIX_TIMESTAMP() WHERE id = " .. rowId)
+            -- v5.5-sync: tts_played=2 чтобы TTS Worker не пытался обработать
+            CharDBExecute("UPDATE ai_responses SET fetched = 1, tts_played = 2, delivered_at = UNIX_TIMESTAMP() WHERE id = " .. rowId)
             Log(string.format("[AI] Player %s offline, marked response id=%d as fetched (orphan cleanup)", playerName or "?", rowId))
         end
         return true
     end
-    
+
+    -- v5.5-sync: Lua показывает текст ТОЛЬКО когда голос сгенерирован (tts_played = 1)
     local sql = string.format(
         "SELECT id, response_text, emote_id, action_command FROM ai_responses " ..
-        "WHERE player_guid = %u AND npc_guid = %u AND fetched = 0 ORDER BY created_at DESC LIMIT 1",
+        "WHERE player_guid = %u AND npc_guid = %u AND fetched = 0 AND tts_played = 1 ORDER BY created_at DESC LIMIT 1",
         playerGuid, targetGuid
     )
     local query = CharDBQuery(sql)
     if not query then
         return false
     end
-    
+
     local rowId     = query:GetUInt32(0)
     local text      = query:GetString(1)
     local emoteId   = query:GetUInt32(2)
     local actionCmd = query:GetString(3)
-    
+
     CharDBExecute("UPDATE ai_responses SET fetched = 1, delivered_at = UNIX_TIMESTAMP() WHERE id = " .. rowId)
 
     local target = nil
@@ -205,7 +207,7 @@ local function CheckAndDeliverResponse(playerGuid, playerName, targetGuid, targe
     if actionCmd and actionCmd ~= "" and actionCmd ~= "null" then
         Log("Action command: " .. actionCmd)
     end
-    
+
     Log(string.format("DELIVERED: %s -> %s: '%s'", targetName, playerName, text:sub(1, 50)))
     return true
 end
@@ -227,14 +229,15 @@ local function GlobalPollLoop()
             pendingChecks[key] = nil
         else
             data.retries = data.retries + 1
-            if data.retries > 60 then
+            if data.retries > 120 then
                 local p = FindPlayerByGUIDLow(data.playerGuid)
                 if p then p:SendBroadcastMessage("|cffff0000[AI]|r Response timeout.") end
                 -- ═══════════════════════════════════════════════════════════════
-                -- ЗАЩИТА: помечаем висящий ответ как fetched, иначе он вылезет позже
+                -- ЗАЩИТА: помечаем висящий ответ как fetched + tts_played=2
+                -- v5.5-sync: tts_played=2 чтобы не зависало в TTS Worker
                 -- ═══════════════════════════════════════════════════════════════
                 local sql = string.format(
-                    "UPDATE ai_responses SET fetched = 1, delivered_at = UNIX_TIMESTAMP() WHERE player_guid = %u AND npc_guid = %u AND fetched = 0",
+                    "UPDATE ai_responses SET fetched = 1, tts_played = 2, delivered_at = UNIX_TIMESTAMP() WHERE player_guid = %u AND npc_guid = %u AND fetched = 0",
                     data.playerGuid, data.targetGuid
                 )
                 local ok = pcall(function() CharDBExecute(sql) end)
@@ -269,18 +272,18 @@ local function HandleBotSay(player, msg)
     if msg:sub(1, #AI_WORLD.NPC_PREFIX) == AI_WORLD.NPC_PREFIX then
         return false
     end
-    
+
     Log("BOT SAY: '" .. msg .. "'")
-    
+
     local group = player:GetGroup()
     if not group then
         DebugToPlayer(player, "No group — bots won't respond")
         return false
     end
-    
+
     local members = group:GetMembers()
     if not members then return false end
-    
+
     local targets = {}
     for i = 1, #members do
         local member = members[i]
@@ -291,18 +294,18 @@ local function HandleBotSay(player, msg)
             end
         end
     end
-    
+
     if #targets == 0 then
         DebugToPlayer(player, "No bots in group")
         return false
     end
-    
+
     DebugToPlayer(player, "Broadcast to " .. #targets .. " bot(s): " .. msg)
-    
+
     for _, bot in ipairs(targets) do
         local botName = bot:GetName()
         local botGuid = bot:GetGUIDLow()
-        
+
         if WriteRequestToDB(player, bot, msg, "SAY-BOT", true) then
             DebugToPlayer(player, "-> " .. botName)
             local key = GenerateKey(player:GetGUIDLow())
@@ -316,7 +319,7 @@ local function HandleBotSay(player, msg)
             }
         end
     end
-    
+
     return true
 end
 
@@ -327,17 +330,17 @@ local function HandleNPCSay(player, msg)
     if msg:sub(1, #AI_WORLD.NPC_PREFIX) ~= AI_WORLD.NPC_PREFIX then
         return false
     end
-    
+
     Log("NPC COMMAND: '" .. msg .. "'")
-    
+
     local afterPrefix = msg:sub(#AI_WORLD.NPC_PREFIX + 1)
-    
+
     local npcNameInput = nil
     local msgOnly = afterPrefix
-    
-    local firstWord = afterPrefix:match("^(%S+)")
+
+    local firstWord = afterPrefix:match("^(%%S+)")
     if firstWord then
-        local rest = afterPrefix:sub(#firstWord + 1):gsub("^%s+", "")
+        local rest = afterPrefix:sub(#firstWord + 1):gsub("^%%s+", "")
         if rest and #rest > 0 then
             npcNameInput = firstWord
             msgOnly = rest
@@ -345,19 +348,19 @@ local function HandleNPCSay(player, msg)
             msgOnly = firstWord
         end
     end
-    
+
     local creatures = player:GetCreaturesInRange(AI_WORLD.SEARCH_RADIUS)
     if not creatures then
         DebugToPlayer(player, "No creatures in range")
         return true
     end
-    
+
     local targetNpc = nil
     local targetName = "Unknown"
     local nearestDist = 9999
-    
+
     local lowerSearchName = npcNameInput and npcNameInput:lower() or nil
-    
+
     for i = 1, #creatures do
         local c = creatures[i]
         if c then
@@ -368,10 +371,10 @@ local function HandleNPCSay(player, msg)
                     if okAttack and canAttack then
                         goto continue_npc_loop
                     end
-                    
+
                     local okDist, dist = pcall(function() return player:GetDistance(c) end)
                     local okName, cName = pcall(function() return c:GetName() end)
-                    
+
                     if okDist and dist and okName and cName then
                         if lowerSearchName then
                             if cName:lower():find(lowerSearchName, 1, true) then
@@ -394,7 +397,7 @@ local function HandleNPCSay(player, msg)
         end
         ::continue_npc_loop::
     end
-    
+
     if not targetNpc then
         if npcNameInput then
             DebugToPlayer(player, "No NPC matching '" .. npcNameInput .. "' found")
@@ -403,16 +406,16 @@ local function HandleNPCSay(player, msg)
         end
         return true
     end
-    
+
     if not msgOnly or #msgOnly == 0 then
         msgOnly = "привет"
     end
-    
+
     local npcGuid = targetNpc:GetGUIDLow()
     local npcEntry = 0
     local okEntry, entryVal = pcall(function() return targetNpc:GetEntry() end)
     if okEntry then npcEntry = entryVal end
-    
+
     if WriteRequestToDB(player, targetNpc, msgOnly, "SAY", false) then
         DebugToPlayer(player, "Talking to NPC: " .. targetName .. " (entry=" .. npcEntry .. ")")
         local key = GenerateKey(player:GetGUIDLow())
@@ -425,7 +428,7 @@ local function HandleNPCSay(player, msg)
             retries        = 0,
         }
     end
-    
+
     return true
 end
 
@@ -489,17 +492,17 @@ local function OnPlayerChat(event, player, msg, msgType, lang, targetName)
         if AI_WORLD.BOT_REPLY_TO_BOT_CHANCE <= 0 then
             return
         end
-        
+
         local botGuid = player:GetGUIDLow()
         local depth = botReplyDepth[botGuid] or 0
         if depth >= 2 then
             return
         end
-        
+
         if math.random(1, 100) > AI_WORLD.BOT_REPLY_TO_BOT_CHANCE then
             return
         end
-        
+
         botReplyDepth[botGuid] = depth + 1
     else
         botReplyDepth = {}
@@ -535,13 +538,13 @@ local MIN_COMBAT_DURATION_SEC = 3     -- игнорировать мгновен
 local function GetWeaponName(unit)
     local unitName = "Unknown"
     pcall(function() unitName = unit:GetName() end)
-    
+
     local methods = {
         { name = "Slot15", fn = function() return unit:GetEquippedItemBySlot(15) end },
         { name = "Slot16", fn = function() return unit:GetEquippedItemBySlot(16) end },
         { name = "Slot17", fn = function() return unit:GetEquippedItemBySlot(17) end },
     }
-    
+
     for _, m in ipairs(methods) do
         local ok, item = pcall(m.fn)
         if ok and item then
@@ -552,7 +555,7 @@ local function GetWeaponName(unit)
             end
         end
     end
-    
+
     Log(string.format("[WeaponDebug] %s -> FAILED (no weapon)", unitName))
     return "руки"
 end
@@ -567,22 +570,22 @@ local function OnEnterCombat(event, player, enemy)
     if okIsBot and isBot then
         return
     end
-    
+
     local guid = player:GetGUIDLow()
     local group = player:GetGroup()
     if not group then
         return
     end
-    
+
     local enemyName = "неизвестный враг"
-    
+
     if enemy then
         local ok, name = pcall(function() return enemy:GetName() end)
         if ok and name and name ~= "" then
             enemyName = name
         end
     end
-    
+
     if enemyName == "неизвестный враг" then
         local ok, victim = pcall(function() return player:GetVictim() end)
         if ok and victim then
@@ -593,7 +596,7 @@ local function OnEnterCombat(event, player, enemy)
             end
         end
     end
-    
+
     if enemyName == "неизвестный враг" then
         local ok, selection = pcall(function() return player:GetSelection() end)
         if ok and selection then
@@ -604,20 +607,17 @@ local function OnEnterCombat(event, player, enemy)
             end
         end
     end
-    
+
     Log(string.format("[CombatDebug] EnterCombat: final enemyName=%s", enemyName))
-    
+
     local participants = {}
-    
+
     local okHp, hpStart = pcall(function() return player:GetHealthPct() end)
     local okMaxHp, maxHp = pcall(function() return player:GetMaxHealth() end)
-    -- ═══════════════════════════════════════════════════════════════
-    -- НОВОЕ v5.4-fix: SafePowerPct вместо GetPowerPct(0)
-    -- ═══════════════════════════════════════════════════════════════
     local manaStart = SafePowerPct(player)
     local okClass, className = pcall(function() return player:GetClassAsString() end)
     local okRace, raceName = pcall(function() return player:GetRaceAsString() end)
-    
+
     table.insert(participants, {
         guid = player:GetGUIDLow(),
         name = player:GetName(),
@@ -630,7 +630,7 @@ local function OnEnterCombat(event, player, enemy)
         is_player = true,
         main_hand = GetWeaponName(player),
     })
-    
+
     local members = group:GetMembers()
     for _, member in ipairs(members) do
         if member and member:GetGUIDLow() ~= player:GetGUIDLow() then
@@ -638,13 +638,10 @@ local function OnEnterCombat(event, player, enemy)
             if ok and isBotMember then
                 local okHp2, hpStart2 = pcall(function() return member:GetHealthPct() end)
                 local okMaxHp2, maxHp2 = pcall(function() return member:GetMaxHealth() end)
-                -- ═══════════════════════════════════════════════════════════════
-                -- НОВОЕ v5.4-fix: SafePowerPct для ботов тоже
-                -- ═══════════════════════════════════════════════════════════════
                 local manaStart2 = SafePowerPct(member)
                 local okClass2, className2 = pcall(function() return member:GetClassAsString() end)
                 local okRace2, raceName2 = pcall(function() return member:GetRaceAsString() end)
-                
+
                 table.insert(participants, {
                     guid = member:GetGUIDLow(),
                     name = member:GetName(),
@@ -660,12 +657,12 @@ local function OnEnterCombat(event, player, enemy)
             end
         end
     end
-    
+
     if #participants <= 1 then
         Log("OnEnterCombat: only player, no bots in group")
         return
     end
-    
+
     if combatSessions[guid] then
         Log("Combat session restarted for " .. player:GetName())
     end
@@ -679,7 +676,7 @@ local function OnEnterCombat(event, player, enemy)
         enemies = { enemyName },
         total_deaths = 0,
         boss_killed = false,
-    }    
+    }
     Log("Combat session started for " .. player:GetName() .. " with " .. (#participants - 1) .. " bots (total " .. #participants .. " participants)")
 end
 
@@ -704,7 +701,7 @@ local KNOWN_BOSSES = {
 local function IsBoss(killed, enemyName)
     local isBoss = false
     local bossReason = ""
-    
+
     -- Проверка 1: rank
     local okRank, rank = pcall(function() return killed:GetRank() end)
     if okRank then
@@ -716,7 +713,7 @@ local function IsBoss(killed, enemyName)
             bossReason = "rank=" .. rank .. " (rare elite)"
         end
     end
-    
+
     -- Проверка 2: HP (ниже порог для инстансовых боссов)
     local okHp, maxHp = pcall(function() return killed:GetMaxHealth() end)
     if okHp and maxHp then
@@ -729,13 +726,13 @@ local function IsBoss(killed, enemyName)
             bossReason = "hp=" .. maxHp .. " (instance boss)"
         end
     end
-    
+
     -- Проверка 3: известные имена
     if KNOWN_BOSSES[enemyName] then
         isBoss = true
         bossReason = "known boss name"
     end
-    
+
     return isBoss, bossReason
 end
 
@@ -744,14 +741,11 @@ local function OnKillCreature(event, player, killed)
     local guid = player:GetGUIDLow()
     local session = combatSessions[guid]
     if not session or not session.active then return end
-    
+
     local ok, enemyName = pcall(function() return killed:GetName() end)
     if not ok or not enemyName then enemyName = "неизвестный враг" end
     table.insert(session.enemies, enemyName)
-    
-    -- ═══════════════════════════════════════════════════════════════
-    -- НОВОЕ v5.4-fix: ИСПОЛЬЗУЕМ УМНОЕ ОПРЕДЕЛЕНИЕ БОССА
-    -- ═══════════════════════════════════════════════════════════════
+
     local isBoss, bossReason = IsBoss(killed, enemyName)
     if isBoss then
         session.boss_killed = true
@@ -761,7 +755,7 @@ local function OnKillCreature(event, player, killed)
 end
 
 -- ============================================
--- COMBAT: LEAVE COMBAT v5.4
+-- COMBAT: LEAVE COMBAT v5.5-sync
 -- ============================================
 
 local function OnLeaveCombat(event, player)
@@ -769,21 +763,19 @@ local function OnLeaveCombat(event, player)
     if okIsBot and isBot then
         return
     end
-    
+
     local guid = player:GetGUIDLow()
     local session = combatSessions[guid]
-    
+
     if not session then
         return
     end
-    
+
     if not session.active then
         return
     end
 
-    -- ═══════════════════════════════════════════════════════════════
     -- ЗАЩИТА ОТ ДРЕБЕЗГА COMBAT-СТАТУСА В ЯДРЕ
-    -- ═══════════════════════════════════════════════════════════════
     local now = os.time()
     if lastPostCombatTime[guid] and (now - lastPostCombatTime[guid]) < POST_COMBAT_DEBOUNCE_SEC then
         Log(string.format("[CombatDebug] OnLeaveCombat DEBOUNCED for %s (last=%d, now=%d, diff=%d)",
@@ -809,7 +801,7 @@ local function OnLeaveCombat(event, player)
     for i, name in ipairs(session.enemies or {}) do
         Log(string.format("[CombatDebug]   raw[%d] = %s (type=%s)", i, tostring(name), type(name)))
     end
-    
+
     local uniqueEnemies = {}
     local enemySeen = {}
     for _, name in ipairs(session.enemies or {}) do
@@ -820,7 +812,7 @@ local function OnLeaveCombat(event, player)
             end
         end
     end
-    
+
     if #uniqueEnemies == 0 and #(session.enemies or {}) > 0 then
         for _, name in ipairs(session.enemies) do
             if name and name ~= "" then
@@ -830,25 +822,22 @@ local function OnLeaveCombat(event, player)
             end
         end
     end
-    
+
     if #uniqueEnemies > 5 then
         local trimmed = {}
         for i = 1, 5 do table.insert(trimmed, uniqueEnemies[i]) end
         uniqueEnemies = trimmed
     end
-    
+
     Log(string.format("[CombatDebug] uniqueEnemies final count=%d", #uniqueEnemies))
     for i, name in ipairs(uniqueEnemies) do
         Log(string.format("[CombatDebug]   unique[%d] = %s", i, tostring(name)))
     end
-    
+
     for _, p in ipairs(session.participants or {}) do
         local member = FindPlayerByGUIDLow(p.guid)
         if member then
             local okHp, hpEnd = pcall(function() return member:GetHealthPct() end)
-            -- ═══════════════════════════════════════════════════════════════
-            -- НОВОЕ v5.4-fix: SafePowerPct вместо GetPowerPct(0)
-            -- ═══════════════════════════════════════════════════════════════
             local manaEnd = SafePowerPct(member)
             p.hp_end = (okHp and hpEnd) or 0
             p.mana_end = manaEnd
@@ -857,30 +846,30 @@ local function OnLeaveCombat(event, player)
             p.mana_end = p.mana_end or 100
         end
     end
-    
+
     Log("=== COMBAT PARTICIPANTS FINAL STATE ===")
     for _, p in ipairs(session.participants or {}) do
         local hpLost = (p.hp_start or 100) - (p.hp_end or 0)
         local manaLost = (p.mana_start or 100) - (p.mana_end or 100)
         Log(string.format("  %s (%s): hp=%.0f->%.0f (lost %.0f%%), mana=%.0f->%.0f (lost %.0f%%), deaths=%.0f, is_player=%s",
-            tostring(p.name), tostring(p.class), 
+            tostring(p.name), tostring(p.class),
             (p.hp_start or 0), (p.hp_end or 0), hpLost,
             (p.mana_start or 100), (p.mana_end or 100), manaLost,
             (p.deaths or 0), tostring(p.is_player)))
     end
-    
+
     local severity, modifiers, triggers, durMod = EvaluateTriggers(session, session.participants)
-    
+
     if not durMod then
         durMod = { chance_bonus = 0, min_chance = 15, category = "unknown" }
     end
-    
+
     local baseChance = COMBAT_CONFIG.BASE_CHANCE_BOT + severity + durMod.chance_bonus
     local finalChance = math.min(COMBAT_CONFIG.MAX_CHANCE, math.max(durMod.min_chance, baseChance))
-    
+
     Log(string.format("[CombatDebug] Duration=%ds, category=%s, bonus=%d, min=%d, base=%d, final=%d%%",
         session.duration, durMod.category, durMod.chance_bonus, durMod.min_chance, baseChance, finalChance))
-    
+
     local speaker = nil
     local aliveBots = {}
     for _, p in ipairs(session.participants or {}) do
@@ -888,37 +877,37 @@ local function OnLeaveCombat(event, player)
             table.insert(aliveBots, p)
         end
     end
-    
+
     if #aliveBots > 0 then
         speaker = aliveBots[math.random(1, #aliveBots)]
     end
-    
+
     if not speaker then
         Log("No bot survivors to comment on combat")
         combatSessions[guid] = nil
         return
     end
-    
+
     if not speaker.guid or not speaker.name then
         Log("ERROR: selected speaker is invalid")
         combatSessions[guid] = nil
         return
     end
-    
+
     local roll = math.random(1, 100)
     Log("Combat ended. Chance: " .. finalChance .. "%, rolled: " .. roll .. " (severity=" .. severity .. ", duration=" .. session.duration .. "s)")
-    
+
     if roll > finalChance then
         Log("No post-combat phrase (roll failed)")
         combatSessions[guid] = nil
         return
     end
-    
+
     local leaderMainHand = "руки"
     if session.participants and session.participants[1] and session.participants[1].main_hand then
         leaderMainHand = session.participants[1].main_hand
     end
-    
+
     local rpData = {
         leader_guid = session.leader_guid,
         leader_name = session.leader_name,
@@ -946,7 +935,7 @@ local function OnLeaveCombat(event, player)
     for _, p in ipairs(session.participants or {}) do
         table.insert(rpData.participants, tostring(p.name))
     end
-        
+
     for _, p in ipairs(session.participants or {}) do
         if (p.deaths or 0) > 0 then
             table.insert(rpData.casualties, tostring(p.name))
@@ -957,19 +946,19 @@ local function OnLeaveCombat(event, player)
             elseif lost >= COMBAT_CONFIG.THRESHOLD_WOUNDED_HP_LOST then
                 table.insert(rpData.wounded, { name = tostring(p.name), state = "серьёзно ранен" })
             end
-            
+
             if lost >= COMBAT_CONFIG.THRESHOLD_HERO_HP_LOST and (#rpData.casualties > 0 or session.duration > COMBAT_CONFIG.THRESHOLD_LONG_FIGHT_SEC) then
                 table.insert(rpData.heroes, tostring(p.name))
             end
         end
     end
-    
+
     local jsonData = json.encode(rpData)
-    
+
     Log("[CombatDebug] JSON enemies_names in payload: " .. tostring(#uniqueEnemies))
     Log("[CombatDebug] JSON duration_category: " .. tostring(durMod.category))
     Log("[CombatDebug] JSON first 800 chars: " .. tostring(jsonData):sub(1, 800))
-    
+
     local sql = string.format(
         "INSERT INTO ai_requests " ..
         "(player_guid, player_name, npc_guid, npc_entry, npc_name, message, channel_type, target_is_player, created_at) " ..
@@ -983,11 +972,11 @@ local function OnLeaveCombat(event, player)
         "POST-COMBAT",
         1
     )
-    
+
     local status, err = pcall(function() CharDBExecute(sql) end)
     if status then
         Log("Post-combat phrase queued for " .. tostring(speaker.name) .. " (leader=" .. tostring(session.leader_name) .. ")")
-        
+
         local key = GenerateKey(session.leader_guid)
         pendingChecks[key] = {
             playerGuid     = session.leader_guid,
@@ -1000,7 +989,7 @@ local function OnLeaveCombat(event, player)
     else
         Log("SQL ERROR (post-combat): " .. tostring(err))
     end
-    
+
     lastPostCombatTime[guid] = os.time()
     combatSessions[guid] = nil
 end
@@ -1013,9 +1002,9 @@ RegisterPlayerEvent(33, OnEnterCombat)
 RegisterPlayerEvent(34, OnLeaveCombat)
 RegisterPlayerEvent(7, OnKillCreature)
 
-Log("Living Azeroth [v5.4-fix] loaded!")
+Log("Living Azeroth [v5.5.1-sync] loaded!")
 Log("NPC prefix: '" .. AI_WORLD.NPC_PREFIX .. "'")
-Log("CombatAnalyst: modular triggers, DURATION_MODIFIERS, SMART_BOSS_DETECT, SafePowerPct")
+Log("TTS: SYNC mode — text waits for voice (tts_played=1), soft timeout 30s")
 
 CreateLuaEvent(GlobalPollLoop, 1000, 0)
 Log("GlobalPollLoop started (1000ms)")
