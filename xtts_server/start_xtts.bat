@@ -12,4 +12,5 @@ if not exist venv (
 )
 
 echo [XTTS] Starting server...
-C:\Python310\python.exe api_server.py
+venv\Scripts\python.exe api_server.py
+pause
