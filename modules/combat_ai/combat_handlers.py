@@ -100,6 +100,20 @@ class CombatAnalyst:
         except Exception as e:
             logger.error("Memory retrieve failed: %s", e)
 
+        # ═══════════════════════════════════════════════════════════════
+        # ЛОГИРОВАНИЕ: видит ли бот свою память прямо сейчас
+        # ═══════════════════════════════════════════════════════════════
+        if active_memory and active_memory.strip():
+            logger.info(
+                "[Memory] Bot %s (guid=%d) retrieved %d chars of active context for combat",
+                speaker_name, speaker_guid, len(active_memory)
+            )
+        else:
+            logger.debug(
+                "[Memory] No relevant memory for bot %s (guid=%d), query='%s'",
+                speaker_name, speaker_guid, search_query
+            )
+
         context = self._build_combat_context(data)
         
         system_prompt = combat_prompts.build_combat_system_prompt(
@@ -136,6 +150,124 @@ class CombatAnalyst:
             daemon=True,
         ).start()
     
+    # ═══════════════════════════════════════════════════════════════════
+    # НОВОЕ: ЖИВЫЕ ВОСПОМИНАНИЯ вместо сухих отчётов
+    # ═══════════════════════════════════════════════════════════════════
+    def _build_vivid_summary(self, data: dict, emotion: str, is_trauma: bool,
+                             enemy_str: str, location_str: str, casualties: list) -> str:
+        """Строит ЖИВОЕ описание боя для долговременной памяти."""
+        race = data.get("speaker_race", "Unknown")
+        weapon = data.get("speaker_main_hand", "руки")
+        speaker_name = data.get("speaker_name", "Unknown")
+        leader = data.get("leader_name", "Лидер")
+        
+        # Атмосферные вставки по расе — запахи, звуки, ощущения
+        race_atmo = {
+            "Night Elf": [
+                "Лесной воздух пах гнилью.",
+                "Элуна светила сквозь ветви.",
+                "Совы замолчали, предчувствуя кровь.",
+                "Хвоя под ногами была мокрой от росы и чего-то тёплого...",
+            ],
+            "Orc": [
+                "Кровь брызнула на доспехи.",
+                "Земля содрогалась от боевого крика.",
+                "Пот и кровь слепили глаза.",
+                "Пахло железом и яростью.",
+            ],
+            "Human": [
+                "Пыль осела на зубах.",
+                "Свет мерцал на кончиках клинков.",
+                "Кто-то молился за спиной.",
+                "Ветер принёс запах пороха и страха.",
+            ],
+            "Undead": [
+                "Гниль врагов смешалась с твоим собственным запахом.",
+                "Холод пробирал до костей — хотя они и без того мёртвые.",
+                "Тишина после боя была громче криков.",
+            ],
+            "Dwarf": [
+                "Горы слышали этот бой.",
+                "Пиво в желудке встало комом.",
+                "Камни под ногами дрожали.",
+                "Пахло серой и крепким элем.",
+            ],
+            "Tauren": [
+                "Мать-Земля содрогалась под копытами.",
+                "Ветер нёс запах крови далеко.",
+                "Трава под ногами окрасилась алым.",
+                "Духи предков шептали с гор.",
+            ],
+            "Troll": [
+                "Духи шептали о смерти.",
+                "Барабаны сердца стучали в ушах.",
+                "Лоа наблюдали с высоты.",
+                "В воздухе пахло джунглями и кровью.",
+            ],
+            "Blood Elf": [
+                "Магия в венах вспыхнула ярче обычного.",
+                "Пыль Кель'Таласа казалась такой далёкой.",
+                "Солнечный свет отражался от клинков.",
+            ],
+            "Gnome": [
+                "Механизм заело от пыли боя.",
+                "Искры летели из карманов.",
+                "Пахло озоном и перегретым маслом.",
+            ],
+            "Draenei": [
+                "Кристалл на шее пульсировал тревожно.",
+                "Свет Наару коснулся тебя в решающий момент.",
+                "Вспомнил запах Экзадара — сладкий и горький.",
+            ],
+        }
+        
+        atmo = ""
+        if race in race_atmo:
+            atmo = random.choice(race_atmo[race]) + " "
+        
+        # Оружие — не просто название, а ощущение
+        weapon_text = ""
+        if weapon != "руки":
+            w_lines = [
+                f"{weapon} не подвёл — как и всегда.",
+                f"{weapon} пронзил плоть врага с хрустом.",
+                f"Руки помнят вес {weapon} — каждый удар был точен.",
+                f"{weapon} вспыхнул в лучах света.",
+                f"Лезвие {weapon} оказалось острее, чем казалось.",
+            ]
+            weapon_text = random.choice(w_lines) + " "
+        else:
+            weapon_text = "Кулаки сделали своё дело. "
+        
+        # Исход боя — через тело и чувства, не через факты
+        if casualties:
+            outcome = (f"Но ценой было слишком много... "
+                       f"{', '.join(casualties)} остались лежать в {location_str}. "
+                       f"Этот запах смерти не выветрится.")
+        elif is_trauma:
+            outcome = (f"Едва выстояли в {location_str}. Ноги дрожали, а сердце — "
+                       f"или то, что от него осталось — колотилось так, что казалось: вот-вот выскочит.")
+        elif emotion == "гордость":
+            outcome = f"Победа в {location_str} была чистой. Ты гордился собой — редкое чувство."
+        elif emotion == "усталость":
+            outcome = f"Разобрались, но {location_str} забрала слишком много сил. Хочется просто упасть."
+        elif emotion == "напряжение":
+            outcome = f"В {location_str} всё закончилось быстро, но руки до сих пор помнят дрожь."
+        else:
+            outcome = f"Разобрались быстро в {location_str} — без лишнего шума."
+        
+        # Лидер — не имя, а связь
+        leader_text = ""
+        if leader and leader != speaker_name:
+            if emotion == "скорбь":
+                leader_text = f" {leader} рядом... но это не уняло боль."
+            elif is_trauma:
+                leader_text = f" {leader} вытащил тебя — ты это запомнишь."
+            else:
+                leader_text = f" {leader} сражался плечом к плечу — это начинает значить кое-что."
+        
+        return f"{atmo}{weapon_text}{outcome}{leader_text}".strip()
+
     def _process_llm_response(self, future, data: dict, request: dict, leader_guid: int):
         """Обработать ответ LLM и записать в ai_responses."""
         
@@ -245,19 +377,18 @@ class CombatAnalyst:
                 intensity = 30
                 is_trauma = False
 
-            summary = f"Бой с {enemy_str}. "
-            if casualties:
-                summary += f"Пали: {', '.join(casualties)}. "
-            elif duration > 60:
-                summary += "Долгая схватка, едва выстояли. "
-            else:
-                summary += "Разобрались быстро. "
+            # ═══════════════════════════════════════════════════════════
+            # ЖИВОЕ ВОСПОМИНАНИЕ вместо сухого "Бой с X. Разобрались быстро."
+            # ═══════════════════════════════════════════════════════════
+            summary = self._build_vivid_summary(
+                data, emotion, is_trauma, enemy_str, location_str, casualties
+            )
 
             self.memory.record_episode(
                 bot_guid=speaker_guid,
                 episode_type="battle",
                 title=f"Бой против {enemy_str}",
-                summary=summary.strip(),
+                summary=summary,
                 location=location_str,
                 subzone=subzone_str,
                 involved=(casualties + [data.get("leader_name", "Лидер")]) if casualties else [data.get("leader_name", "Лидер")],
@@ -268,16 +399,23 @@ class CombatAnalyst:
             )
 
             # Социальная память о лидере
-            if leader_guid and leader_guid != speaker_guid:
+            if leader_guid and leader_guid != speaker_guid and data.get("leader_name"):
                 trust_delta = 5 if not casualties else (-10 if data.get("leader_name") in casualties else 3)
-                self.memory.update_social(
-                    bot_guid=speaker_guid,
-                    target_guid=leader_guid,
-                    target_name=data.get("leader_name", "Лидер"),
-                    target_type="player",
-                    trust_delta=trust_delta,
-                    shared_note=f"Бой в {location_str} против {enemy_str}. {'Победа' if not casualties else 'Есть потери'}.",
-                )
+                try:
+                    self.memory.update_social(
+                        bot_guid=speaker_guid,
+                        target_guid=leader_guid,
+                        target_name=data.get("leader_name", "Лидер"),
+                        target_type="player",
+                        trust_delta=trust_delta,
+                        shared_note=f"Бой в {location_str} против {enemy_str}. {'Победа' if not casualties else 'Есть потери'}.",
+                    )
+                    logger.info(
+                        "[Memory] Social link updated: bot %s -> player %s (trust %+d)",
+                        speaker_name, data.get("leader_name"), trust_delta
+                    )
+                except Exception as e:
+                    logger.error("Failed to update social memory: %s", e)
 
             # Чистим старый трэш, но боссов оставляем
             self.memory.cleanup_episodes(speaker_guid)
