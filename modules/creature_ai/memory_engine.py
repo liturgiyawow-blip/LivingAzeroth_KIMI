@@ -16,7 +16,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pymysql
 
@@ -31,11 +31,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MemoryConfig:
-    max_context_chars: int = 900      # жёсткий лимит в промпт
+    max_context_chars: int = 400      # жёсткий лимит в промпт (в бою не перегружаем)
     l2_episodes_limit: int = 2        # сколько эпизодов взять
-    l3_facts_limit: int = 3           # сколько фактов взять
+    l3_facts_limit: int = 1           # сколько фактов взять (в бою мало)
     l4_social_limit: int = 1          # сколько социальных записей
-    cache_size: int = 100             # LRU-кэш записей
+    cache_ttl_sec: float = 60.0       # кэш retrieve на 60 секунд
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -50,11 +50,12 @@ _TOPIC_TRIGGERS: Dict[str, List[str]] = {
     "подгород": ["подгород", "сильвана", "отрекшиеся"],
     "дарнас": ["дарнас", "телдрассил", "элуна", "ночные_эльфы"],
     "стальгорд": ["стальгорд", "дворфы", "титаны", "горы"],
+    "элвинн": ["элвинн", "голдшир", "штормград", "лес"],
     # --- Фракции / угрозы ---
     "плеть": ["плеть", "артас", "король_лич", "нежить", "чума", "скелет"],
     "орда": ["орда", "гром", "тарен", "клан"],
     "альянс": ["альянс", "свет", "лордерон"],
-    "пылающий легион": ["легион", "демон", "скверна", "саргерас"],
+    "легион": ["легион", "демон", "скверна", "саргерас"],
     # --- Личное ---
     "семья": ["мать", "отец", "брат", "сестра", "родители", "сын", "дочь"],
     "дом": ["дом", "родина", "деревня", "ферма", "очаг"],
@@ -72,6 +73,7 @@ _TOPIC_TRIGGERS: Dict[str, List[str]] = {
     "бой": ["бой", "битва", "сражение", "война", "кровь"],
     "поражение": ["поражение", "вайп", "падение", "гибель", "потеря"],
     "победа": ["победа", "триумф", "возмездие", "месть"],
+    "босс": ["босс", "главарь", "вождь", "повелитель"],
 }
 
 
@@ -92,8 +94,9 @@ class BotMemoryEngine:
             "charset": "utf8mb4",
             "autocommit": True,
         }
-        # LRU-кэш: ключ "table:id" → запись
-        self._cache: OrderedDict[str, dict] = OrderedDict()
+        # LRU-кэш retrieve: ключ (bot_guid, query_hash) → (timestamp, text)
+        self._cache: OrderedDict[str, tuple] = OrderedDict()
+        self._cache_maxsize = 200
 
     # ═══════════════════════════════════════════════════════════════
     # ПУБЛИЧНЫЙ API
@@ -107,19 +110,35 @@ class BotMemoryEngine:
         Возвращает готовый текст для вставки в system_prompt.
         """
         start = time.time()
+        cache_key = f"{bot_guid}:{hash(player_message + bot_race + bot_class)}"
 
-        # 1. Извлекаем теги из сообщения игрока
-        tags = self._extract_tags(player_message.lower())
+        # 1. Проверка кэша
+        now = time.time()
+        if cache_key in self._cache:
+            ts, text = self._cache[cache_key]
+            if now - ts < self.cfg.cache_ttl_sec:
+                logger.debug("Memory cache HIT for bot %d", bot_guid)
+                return text
+            else:
+                del self._cache[cache_key]
 
-        # 2. Собираем слои
-        core = self._fetch_core(bot_guid)
-        working = self._fetch_working(bot_guid)
-        episodes = self._fetch_episodes(bot_guid, tags)
-        facts = self._fetch_semantic(bot_guid, tags)
-        social = self._fetch_social(bot_guid, player_guid, player_name)
+        # 2. Извлекаем теги
+        tags = self._extract_tags((player_message + " " + bot_race + " " + bot_class).lower())
 
-        # 3. Компилируем в текст
+        # 3. Собираем слои (с graceful fallback если таблицы пусты/отсутствуют)
+        core = self._safe_fetch(lambda: self._fetch_core(bot_guid))
+        working = self._safe_fetch(lambda: self._fetch_working(bot_guid))
+        episodes = self._safe_fetch(lambda: self._fetch_episodes(bot_guid, tags))
+        facts = self._safe_fetch(lambda: self._fetch_semantic(bot_guid, tags))
+        social = self._safe_fetch(lambda: self._fetch_social(bot_guid, player_guid, player_name))
+
+        # 4. Компилируем
         context = self._compile(core, working, episodes, facts, social)
+
+        # 5. Кладём в кэш
+        self._cache[cache_key] = (now, context)
+        if len(self._cache) > self._cache_maxsize:
+            self._cache.popitem(last=False)
 
         elapsed = (time.time() - start) * 1000
         logger.debug("Memory retrieve for bot %d in %.1f ms | tags=%s",
@@ -127,21 +146,24 @@ class BotMemoryEngine:
         return context
 
     def record_episode(self, bot_guid: int, episode_type: str, title: str,
-                       summary: str, location: str = None,
+                       summary: str, location: str = None, subzone: str = None,
                        involved: List[str] = None, emotional_tag: str = "нейтральный",
-                       intensity: int = 50, is_trauma: bool = False):
+                       intensity: int = 50, is_trauma: bool = False,
+                       is_boss: bool = False):
         """Записать событие в эпизодическую память."""
         involved_str = ";".join(involved) if involved else None
         sql = """
             INSERT INTO bot_episodic_memory
-            (bot_guid, episode_type, title, summary, location,
-             involved_entities, emotional_tag, intensity, is_trauma, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, UNIX_TIMESTAMP())
+            (bot_guid, episode_type, title, summary, location, subzone,
+             involved_entities, emotional_tag, intensity, is_trauma, is_boss, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, UNIX_TIMESTAMP())
         """
         self._execute(sql, (bot_guid, episode_type, title, summary,
-                            location, involved_str, emotional_tag,
-                            intensity, 1 if is_trauma else 0))
-        logger.info("Episode recorded for bot %d: [%s] %s", bot_guid, episode_type, title)
+                            location, subzone, involved_str, emotional_tag,
+                            intensity, 1 if is_trauma else 0,
+                            1 if is_boss else 0))
+        logger.info("Episode recorded for bot %d: [%s] %s (boss=%s)",
+                    bot_guid, episode_type, title, is_boss)
 
     def record_fact(self, bot_guid: int, domain: str, topic: str,
                     content: str, importance: int = 50,
@@ -161,7 +183,6 @@ class BotMemoryEngine:
                       trust_delta: int = 0, affection_delta: int = 0,
                       shared_note: str = None):
         """Обновить или создать социальную запись."""
-        # Пробуем обновить
         updates = []
         params = []
         if relationship:
@@ -186,7 +207,6 @@ class BotMemoryEngine:
             params.extend([bot_guid, target_guid])
             affected = self._execute(sql_upd, tuple(params), fetch=False)
             if affected == 0:
-                # Создаём новую запись
                 sql_ins = """
                     INSERT INTO bot_social_memory
                     (bot_guid, target_guid, target_name, target_type,
@@ -217,26 +237,46 @@ class BotMemoryEngine:
         """
         self._execute(sql, (bot_guid, *params), fetch=False)
 
-    def init_core(self, bot_guid: int, **fields):
-        """Установить базовую личность (один раз при рождении бота)."""
-        cols = []
-        vals = []
-        for k, v in fields.items():
-            cols.append(k)
-            vals.append(v)
-        sql = f"""
-            INSERT INTO bot_core_memory (bot_guid, {', '.join(cols)}, created_at)
-            VALUES (%s, {', '.join(['%s'] * len(vals))}, UNIX_TIMESTAMP())
-            ON DUPLICATE KEY UPDATE {', '.join(f'{c}=%s' for c in cols)}, updated_at = UNIX_TIMESTAMP()
+    def cleanup_episodes(self, bot_guid: int):
         """
-        self._execute(sql, (bot_guid, *vals, *vals), fetch=False)
+        Агрессивная очистка:
+        - Обычные бои (is_boss=0): оставить последние 20
+        - Боссы (is_boss=1): оставить последние 10
+        """
+        # 1. Обычные
+        sql_normal = """
+            DELETE FROM bot_episodic_memory
+            WHERE bot_guid = %s AND is_boss = 0
+              AND id NOT IN (
+                  SELECT id FROM (
+                      SELECT id FROM bot_episodic_memory
+                      WHERE bot_guid = %s AND is_boss = 0
+                      ORDER BY created_at DESC LIMIT 20
+                  ) tmp
+              )
+        """
+        self._execute(sql_normal, (bot_guid, bot_guid), fetch=False)
+
+        # 2. Боссы
+        sql_boss = """
+            DELETE FROM bot_episodic_memory
+            WHERE bot_guid = %s AND is_boss = 1
+              AND id NOT IN (
+                  SELECT id FROM (
+                      SELECT id FROM bot_episodic_memory
+                      WHERE bot_guid = %s AND is_boss = 1
+                      ORDER BY created_at DESC LIMIT 10
+                  ) tmp
+              )
+        """
+        self._execute(sql_boss, (bot_guid, bot_guid), fetch=False)
+        logger.debug("Cleaned up old episodes for bot %d", bot_guid)
 
     # ═══════════════════════════════════════════════════════════════
     # ВНУТРЕННЯЯ ЛОГИКА
     # ═══════════════════════════════════════════════════════════════
 
     def _extract_tags(self, text: str) -> List[str]:
-        """Простая эвристика: текст → список релевантных тегов."""
         tags = set()
         for topic, keywords in _TOPIC_TRIGGERS.items():
             for kw in keywords:
@@ -244,6 +284,14 @@ class BotMemoryEngine:
                     tags.add(topic)
                     break
         return list(tags)
+
+    def _safe_fetch(self, fn):
+        """Graceful fallback: если таблицы нет или ошибка — вернуть None/[] без краша."""
+        try:
+            return fn()
+        except Exception as e:
+            logger.warning("Memory fetch failed (table missing?): %s", e)
+            return None
 
     def _fetch_core(self, bot_guid: int) -> Optional[Dict]:
         row = self._query_one(
@@ -271,34 +319,30 @@ class BotMemoryEngine:
         }
 
     def _fetch_episodes(self, bot_guid: int, tags: List[str]) -> List[Dict]:
-        """Сначала ищем по тегам/эмоциям, потом — самые яркие травмы."""
         if tags:
-            # Ищем эпизоды, где emotional_tag или location совпадают с тегами
             like_clauses = " OR ".join(["emotional_tag = %s"] * len(tags))
             sql = f"""
-                SELECT title, summary, emotional_tag, intensity
+                SELECT title, summary, emotional_tag, intensity, is_boss
                 FROM bot_episodic_memory
                 WHERE bot_guid = %s AND ({like_clauses})
-                ORDER BY intensity DESC, last_accessed DESC
+                ORDER BY is_boss DESC, intensity DESC, last_accessed DESC
                 LIMIT %s
             """
             rows = self._query(sql, (bot_guid, *tags, self.cfg.l2_episodes_limit))
             if rows:
                 return rows
 
-        # Fallback: самые яркие воспоминания (или травмы)
         sql = """
-            SELECT title, summary, emotional_tag, intensity
+            SELECT title, summary, emotional_tag, intensity, is_boss
             FROM bot_episodic_memory
             WHERE bot_guid = %s
-            ORDER BY intensity DESC, last_accessed DESC
+            ORDER BY is_boss DESC, intensity DESC, last_accessed DESC
             LIMIT %s
         """
         return self._query(sql, (bot_guid, self.cfg.l2_episodes_limit))
 
     def _fetch_semantic(self, bot_guid: int, tags: List[str]) -> List[Dict]:
         if tags:
-            # FULLTEXT или по domain/topic
             topic_likes = " OR ".join(["topic LIKE %s"] * len(tags))
             sql = f"""
                 SELECT domain, topic, content, importance
@@ -338,7 +382,7 @@ class BotMemoryEngine:
     def _compile(self, core, working, episodes, facts, social) -> str:
         lines = []
 
-        # --- L0: Core (всегда, если есть) ---
+        # L0: Core
         if core:
             lines.append(f"Твоё имя — {core.get('name') or 'неизвестно'}.")
             if core.get("homeland"):
@@ -354,11 +398,13 @@ class BotMemoryEngine:
             if core.get("item"):
                 lines.append(f"Самая ценная вещь: {core['item']}.")
 
-        # --- L1: Working ---
+        # L1: Working
         if working:
             w = []
             if working.get("zone"):
                 w.append(f"сейчас в {working['zone']}")
+            if working.get("subzone"):
+                w.append(f"район — {working['subzone']}")
             if working.get("mood"):
                 w.append(f"настроение — {working['mood']}")
             if working.get("goal"):
@@ -375,7 +421,7 @@ class BotMemoryEngine:
             if w:
                 lines.append("Сейчас: " + ", ".join(w) + ".")
 
-        # --- L4: Social (перед эпизодами, т.к. личное) ---
+        # L4: Social
         if social:
             rel = social.get("relationship", "знакомый")
             trust = social.get("trust", 50)
@@ -384,17 +430,18 @@ class BotMemoryEngine:
             if social.get("history"):
                 lines.append(f"Ваша общая история: {social['history'][:120]}")
 
-        # --- L2: Episodic ---
+        # L2: Episodic
         if episodes:
             lines.append("Вспоминаешь:")
             for ep in episodes:
-                lines.append(f"— {ep['col1']}")
+                boss_mark = " [ЭПИЧНО]" if ep.get("is_boss") else ""
+                lines.append(f"— {ep['summary']}{boss_mark}")
 
-        # --- L3: Semantic ---
+        # L3: Semantic
         if facts:
             lines.append("Знаешь:")
             for f in facts:
-                lines.append(f"— {f['col2']}")
+                lines.append(f"— {f['content']}")
 
         text = "\n".join(lines)
         if len(text) > self.cfg.max_context_chars:

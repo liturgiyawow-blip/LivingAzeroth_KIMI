@@ -15,8 +15,10 @@ import config
 from core.llm_queue import PriorityLLMQueue
 from core.world_state import WorldState
 from wow_connector.db_bridge import WoWDBBridge
+from wow_connector.game_data import GameDataProvider
 
 from modules.combat_ai import combat_prompts
+from modules.creature_ai.memory_engine import BotMemoryEngine, MemoryConfig
 
 logger = logging.getLogger(__name__)
 prompt_logger = logging.getLogger("llm_prompts")
@@ -34,6 +36,17 @@ class CombatAnalyst:
         self.db = db_bridge
         
         self.db.register_callback(self._on_combat_data)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # НОВОЕ: движок памяти для post-combat контекста
+        # ═══════════════════════════════════════════════════════════════
+        self.memory = BotMemoryEngine(MemoryConfig(
+            max_context_chars=400,
+            l2_episodes_limit=2,
+            l3_facts_limit=1,
+            l4_social_limit=1,
+        ))
+        self.game_data = GameDataProvider()
         
         logger.info("CombatAnalyst initialized")
 
@@ -64,10 +77,36 @@ class CombatAnalyst:
         speaker_name = data["speaker_name"]
         leader_guid = data.get("leader_guid", speaker_guid)
         
+        # ═══════════════════════════════════════════════════════════════
+        # НОВОЕ: достаём память спикера для контекста боя
+        # ═══════════════════════════════════════════════════════════════
+        search_query = " ".join(filter(None, [
+            data.get("boss_name", ""),
+            " ".join(data.get("enemies_names", [])),
+            "бой" if data.get("casualties") else "",
+            "падение товарищей" if data.get("casualties") else "победа",
+        ]))
+
+        active_memory = ""
+        try:
+            active_memory = self.memory.retrieve(
+                bot_guid=speaker_guid,
+                player_message=search_query,
+                player_name=data.get("leader_name", ""),
+                player_guid=leader_guid,
+                bot_race=data.get("speaker_race", ""),
+                bot_class=data.get("speaker_class", ""),
+            )
+        except Exception as e:
+            logger.error("Memory retrieve failed: %s", e)
+
         context = self._build_combat_context(data)
         
-        system_prompt = combat_prompts.build_combat_system_prompt(context)
+        system_prompt = combat_prompts.build_combat_system_prompt(
+            context, memory_context=active_memory
+        )
         user_prompt = combat_prompts.build_combat_user_prompt()
+        
         # ═══════════════════════════════════════════════════════════════
         # ЛОГИРОВАНИЕ COMBAT-ПРОМПТА
         # ═══════════════════════════════════════════════════════════════
@@ -86,8 +125,8 @@ class CombatAnalyst:
         future = self.llm.submit(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            temperature=0.9,  # FIX v5.3: Больше креативности
-            max_tokens=200,   # FIX v5.3: Длинные речи
+            temperature=0.9,
+            max_tokens=200,
             priority=2,
         )
         
@@ -156,6 +195,95 @@ class CombatAnalyst:
             f"{self.world.get_nested('meta.world_hour', 12)}:00 — "
             f"Bot {speaker_name} commented on combat"
         )
+
+        # ═══════════════════════════════════════════════════════════════
+        # НОВОЕ: записываем эпизод боя в память спикера + социалку с лидером
+        # ═══════════════════════════════════════════════════════════════
+        try:
+            casualties = data.get("casualties", [])
+            wounded = data.get("wounded", [])
+            enemies = data.get("enemies_names", [])
+            boss = data.get("boss_name")
+            duration = data.get("duration_sec", 0)
+            zone_id = data.get("zone_id", 0)
+            area_id = data.get("area_id", 0)
+
+            # Резолв локации
+            location_str = "неизвестно"
+            subzone_str = None
+            if zone_id:
+                zn = self.game_data.get_area_name(zone_id)
+                if zn:
+                    location_str = zn
+            if area_id and area_id != zone_id:
+                an = self.game_data.get_area_name(area_id)
+                if an and an != location_str:
+                    subzone_str = an
+
+            is_boss = bool(boss)
+            enemy_str = boss if boss else (enemies[0] if enemies else "враги")
+
+            # Эмоция и интенсивность
+            if casualties:
+                emotion = "скорбь"
+                intensity = 85
+                is_trauma = True
+            elif wounded:
+                emotion = "напряжение"
+                intensity = 60
+                is_trauma = False
+            elif is_boss:
+                emotion = "гордость"
+                intensity = 75
+                is_trauma = False
+            elif duration > 120:
+                emotion = "усталость"
+                intensity = 50
+                is_trauma = False
+            else:
+                emotion = "нейтральный"
+                intensity = 30
+                is_trauma = False
+
+            summary = f"Бой с {enemy_str}. "
+            if casualties:
+                summary += f"Пали: {', '.join(casualties)}. "
+            elif duration > 60:
+                summary += "Долгая схватка, едва выстояли. "
+            else:
+                summary += "Разобрались быстро. "
+
+            self.memory.record_episode(
+                bot_guid=speaker_guid,
+                episode_type="battle",
+                title=f"Бой против {enemy_str}",
+                summary=summary.strip(),
+                location=location_str,
+                subzone=subzone_str,
+                involved=(casualties + [data.get("leader_name", "Лидер")]) if casualties else [data.get("leader_name", "Лидер")],
+                emotional_tag=emotion,
+                intensity=intensity,
+                is_trauma=is_trauma,
+                is_boss=is_boss,
+            )
+
+            # Социальная память о лидере
+            if leader_guid and leader_guid != speaker_guid:
+                trust_delta = 5 if not casualties else (-10 if data.get("leader_name") in casualties else 3)
+                self.memory.update_social(
+                    bot_guid=speaker_guid,
+                    target_guid=leader_guid,
+                    target_name=data.get("leader_name", "Лидер"),
+                    target_type="player",
+                    trust_delta=trust_delta,
+                    shared_note=f"Бой в {location_str} против {enemy_str}. {'Победа' if not casualties else 'Есть потери'}.",
+                )
+
+            # Чистим старый трэш, но боссов оставляем
+            self.memory.cleanup_episodes(speaker_guid)
+
+        except Exception as e:
+            logger.error("Failed to record combat episode: %s", e)
     
     def _build_combat_context(self, data: dict) -> dict:
         """Преобразовать raw данные Lua в читаемый контекст."""
@@ -178,8 +306,6 @@ class CombatAnalyst:
                 seen.add(name)
             participants = list(seen)
 
-
-        
         return {
             "speaker_name": data.get("speaker_name", "Unknown"),
             "speaker_race": data.get("speaker_race", "Unknown"),
@@ -195,12 +321,15 @@ class CombatAnalyst:
             "boss_name": data.get("boss_name"),
             "enemy_count": data.get("enemy_count", 0),
             "participants": participants,
-            # FIX: Читаем из JSON вместо хардкода
             "enemies_names": data.get("enemies_names", []),
             "speaker_main_hand": data.get("speaker_main_hand", "руки"),
             "leader_name": data.get("leader_name", "Unknown"),
             "leader_main_hand": data.get("leader_main_hand", "руки"),
+            # НОВОЕ: локация из Lua
+            "zone_id": data.get("zone_id", 0),
+            "area_id": data.get("area_id", 0),
         }
+    
     def _choose_emote(self, data: dict) -> int:
         """Выбрать эмоцию по контексту боя."""
         casualties = data.get("casualties", [])

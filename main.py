@@ -19,6 +19,7 @@ from core.event_bus import EventBus
 from core.module_registry import ModuleRegistry
 from wow_connector.db_bridge import WoWDBBridge
 from modules.creature_ai.handlers import CreatureAIHandler
+from modules.creature_ai.memory_loader import MemoryLoader
 
 # ═══════════════════════════════════════════════════════════════════
 # COMBAT ANALYST — НОВЫЙ МОДУЛЬ
@@ -76,6 +77,8 @@ else:
 
 # Запуск DB Bridge (начать polling MySQL)
 db_bridge.start()
+loader = MemoryLoader()
+loader.load_all(force_reload=False) # True = полная перезапись semantic
 
 # ═══════════════════════════════════════════════════════════════════
 # DATABASE CLEANUP — автоматическая очистка старых записей

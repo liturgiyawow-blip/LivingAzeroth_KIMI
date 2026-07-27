@@ -197,7 +197,7 @@ DURATION_RULES = {
 # ПОСТРОЕНИЕ ПРОМПТА
 # ═══════════════════════════════════════════════════════════════════
 
-def build_combat_system_prompt(ctx: dict) -> str:
+def build_combat_system_prompt(ctx: dict, memory_context: str = "") -> str:
     speaker = ctx.get("speaker_name", "Неизвестный")
     speaker_race = ctx.get("speaker_race", "Неизвестная раса")
     speaker_class = ctx.get("speaker_class", "Неизвестный класс")
@@ -281,6 +281,8 @@ def build_combat_system_prompt(ctx: dict) -> str:
 
 {race_block}
 
+{memory_block}
+
 {class_block}
 
 ═══════════════════════════════════════════════════════════════════
@@ -299,6 +301,15 @@ def build_combat_system_prompt(ctx: dict) -> str:
 {heroes_text}
 
 {triggers_text}
+
+    memory_block = ""
+    if memory_context:
+        memory_block = f"""
+═══════════════════════════════════════════════════════════════════
+ВСПЛЫВАЮЩИЕ ВОСПОМИНАНИЯ (не произноси всё сразу, пусть одно-два просочатся естественно):
+═══════════════════════════════════════════════════════════════════
+{memory_context}
+"""
 
 ═══════════════════════════════════════════════════════════════════
 КРИТИЧЕСКИЕ ПРАВИЛА:

@@ -20,7 +20,7 @@ local AI_WORLD = {
     FIND_RADIUS   = 100,
     NPC_PREFIX = "№",
     DEBUG = true,
-    BOT_REPLY_TO_BOT_CHANCE = 7,
+    BOT_REPLY_TO_BOT_CHANCE = 3,
 }
 
 -- ============================================
@@ -222,7 +222,13 @@ local function GenerateKey(playerGuid)
     return string.format("%u_%u", playerGuid, pollCounter)
 end
 
+local gcCounter = 0
 local function GlobalPollLoop()
+    gcCounter = gcCounter + 1
+    if gcCounter >= 30 then
+        collectgarbage("collect")
+        gcCounter = 0
+    end
     for key, data in pairs(pendingChecks) do
         local done = CheckAndDeliverResponse(data.playerGuid, data.playerName, data.targetGuid, data.targetIsPlayer, data.targetName)
         if done then
