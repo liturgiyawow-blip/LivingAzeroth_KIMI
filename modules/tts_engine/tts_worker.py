@@ -1,15 +1,5 @@
 """
-TTS Worker v2.1 — FIX: старые записи не блокируют новые
-
-АРХИТЕКТУРА:
-  Этап 1 (ГЕНЕРАЦИЯ): fetched=0 AND tts_played=0 AND created_at > NOW-5min
-    → ORDER BY id DESC (новые первыми)
-    → генерируем голос, сохраняем в RAM-кэш
-    → ставим tts_played = 1
-
-  Этап 2 (ВОСПРОИЗВЕДЕНИЕ): fetched=1 AND tts_played=1
-    → проигрываем звук из RAM-кэша
-    → ставим tts_played = 2
+TTS Worker v2.2 — FIX: утечки, умный поллинг, RAM-TTL
 """
 
 import logging
@@ -33,6 +23,7 @@ if not getattr(config, "TTS_ENABLED", False):
 class TTSWorker:
     def __init__(self):
         self._running = True
+        self._http = requests.Session()
         self._db_config = {
             "host": config.MYSQL_HOST,
             "port": config.MYSQL_PORT,
@@ -42,24 +33,21 @@ class TTSWorker:
             "charset": "utf8mb4",
             "autocommit": True,
         }
-        # RAM-кэш сгенерированного аудио: {response_id: wav_bytes}
+        # RAM-кэш аудио
         self._audio_cache: dict[int, bytes] = {}
+        self._cache_time: dict[int, float] = {}   # для TTL-очистки
+        self._empty_poll_count = 0
+        self._max_cache_size = 50
+        self._cache_ttl_sec = 300                  # 5 минут
 
     def _get_conn(self):
         return pymysql.connect(**self._db_config)
 
-    # ═══════════════════════════════════════════════════════════════════
-    # ЭТАП 1: ГЕНЕРАЦИЯ ГОЛОСА
-    # FIX v2.1: только свежие записи (5 мин), новые первыми (DESC)
-    # ═══════════════════════════════════════════════════════════════════
     def _fetch_to_generate(self) -> list[dict]:
-        """Найти ответы, для которых нужно сгенерировать голос."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                # FIX: created_at > UNIX_TIMESTAMP() - 300 (5 минут)
-                # FIX: ORDER BY id DESC — новые записи в приоритете
-                # FIX: LIMIT 20 — больше записей за раз
+                # FIX: свежие записи, но не старше 5 минут
                 sql = """
                     SELECT r.id, r.player_guid, r.npc_guid, r.npc_entry,
                            r.response_text, r.emote_id
@@ -72,7 +60,7 @@ class TTSWorker:
                 """
                 cur.execute(sql)
                 rows = cur.fetchall()
-                result = [
+                return [
                     {
                         "id": row[0],
                         "player_guid": row[1],
@@ -83,10 +71,6 @@ class TTSWorker:
                     }
                     for row in rows
                 ]
-                if result:
-                    ids = [r["id"] for r in result]
-                    logger.info("[GEN] Found %d responses to generate: ids=%s", len(result), ids)
-                return result
         except Exception as e:
             logger.error("Fetch (generate) error: %s", e)
             return []
@@ -94,26 +78,20 @@ class TTSWorker:
             conn.close()
 
     def _generate_tts(self, text: str, race: str, gender: str) -> Optional[bytes]:
-        """Сгенерировать TTS, вернуть WAV bytes. None при ошибке."""
         try:
             ref_path = get_voice_path(race, gender)
             if not ref_path.exists():
                 logger.error("Ref audio not found: %s", ref_path)
                 return None
 
-            ref_text = get_ref_text(race, gender)
-            if not ref_text:
-                logger.error("Ref text empty for %s %s", race, gender)
-                return None
-
             payload = {
                 "text": text,
                 "ref_audio": str(ref_path.resolve()),
-                "ref_text": ref_text,
+                "ref_text": get_ref_text(race, gender) or "",
             }
 
             start = time.time()
-            resp = requests.post(
+            resp = self._http.post(
                 f"{config.TTS_API_URL}/inference",
                 json=payload,
                 timeout=120,
@@ -135,7 +113,6 @@ class TTSWorker:
             return None
 
     def _mark_tts_ready(self, response_id: int):
-        """Поставить tts_played=1 (голос готов, Lua может показывать текст)."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
@@ -148,11 +125,7 @@ class TTSWorker:
         finally:
             conn.close()
 
-    # ═══════════════════════════════════════════════════════════════════
-    # ЭТАП 2: ВОСПРОИЗВЕДЕНИЕ
-    # ═══════════════════════════════════════════════════════════════════
     def _fetch_to_play(self) -> list[dict]:
-        """Найти ответы, текст которых уже показан, а звук ещё не проигран."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
@@ -174,7 +147,6 @@ class TTSWorker:
             conn.close()
 
     def _play_audio(self, audio_data: bytes):
-        """Воспроизвести WAV-данные через локальные колонки."""
         try:
             import sounddevice as sd
             import soundfile as sf
@@ -185,16 +157,12 @@ class TTSWorker:
                 sd.play(data, samplerate)
                 sd.wait()
         except ImportError:
-            out_path = config.LOGS_DIR / "last_tts.wav"
-            with open(out_path, "wb") as f:
-                f.write(audio_data)
-            logger.info(
-                "Audio saved to %s (install sounddevice+soundfile for playback)",
-                out_path,
-            )
+            # Не пишем на диск каждый раз — просто логируем
+            logger.warning("sounddevice not installed, skipping playback")
+        except Exception as e:
+            logger.error("Playback error: %s", e)
 
     def _mark_tts_delivered(self, response_id: int):
-        """Поставить tts_played=2 (звук воспроизведён, цикл завершён)."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
@@ -207,9 +175,26 @@ class TTSWorker:
         finally:
             conn.close()
 
-    # ═══════════════════════════════════════════════════════════════════
-    # ВСПОМОГАТЕЛЬНЫЕ
-    # ═══════════════════════════════════════════════════════════════════
+    def _cleanup_stale_cache(self):
+        """Удалить записи старше TTL и при переполнении."""
+        now = time.time()
+        # TTL-очистка
+        stale = [
+            rid for rid, t in self._cache_time.items()
+            if now - t > self._cache_ttl_sec
+        ]
+        for rid in stale:
+            self._audio_cache.pop(rid, None)
+            self._cache_time.pop(rid, None)
+            logger.debug("Cache TTL cleanup for id=%d", rid)
+
+        # Ограничение размера
+        while len(self._audio_cache) > self._max_cache_size:
+            oldest = min(self._cache_time, key=self._cache_time.get)
+            self._audio_cache.pop(oldest, None)
+            self._cache_time.pop(oldest, None)
+            logger.debug("Cache size cleanup for id=%d", oldest)
+
     def _get_bot_info(self, bot_guid: int) -> Optional[dict]:
         conn = self._get_conn()
         try:
@@ -222,16 +207,9 @@ class TTSWorker:
                 if not row:
                     return None
                 race_map = {
-                    1: "Human",
-                    2: "Orc",
-                    3: "Dwarf",
-                    4: "Night Elf",
-                    5: "Undead",
-                    6: "Tauren",
-                    7: "Gnome",
-                    8: "Troll",
-                    10: "Blood Elf",
-                    11: "Draenei",
+                    1: "Human", 2: "Orc", 3: "Dwarf", 4: "Night Elf",
+                    5: "Undead", 6: "Tauren", 7: "Gnome", 8: "Troll",
+                    10: "Blood Elf", 11: "Draenei",
                 }
                 return {
                     "race": race_map.get(row[0], "Human"),
@@ -243,15 +221,17 @@ class TTSWorker:
         finally:
             conn.close()
 
-    # ═══════════════════════════════════════════════════════════════════
-    # ГЛАВНЫЙ ЦИКЛ
-    # ═══════════════════════════════════════════════════════════════════
     def run(self):
-        logger.info("TTS Worker v2.1 started. Mode: SYNC + fresh-first")
+        logger.info("TTS Worker v2.2 started. Mode: SYNC + optimized")
         while self._running:
             try:
-                # === ЭТАП 1: Генерация голоса ===
+                self._cleanup_stale_cache()
+
+                # === ЭТАП 1: Генерация ===
                 to_generate = self._fetch_to_generate()
+                to_play = self._fetch_to_play()
+                had_work = bool(to_generate or to_play)
+
                 for resp in to_generate:
                     logger.info("[GEN] Starting id=%d (%d chars)", resp["id"], len(resp["text"]))
                     info = self._get_bot_info(resp["npc_guid"])
@@ -265,33 +245,40 @@ class TTSWorker:
                         )
 
                     if audio_data:
+                        # Защита от переполнения
+                        if len(self._audio_cache) >= self._max_cache_size:
+                            self._cleanup_stale_cache()
                         self._audio_cache[resp["id"]] = audio_data
+                        self._cache_time[resp["id"]] = time.time()
                         self._mark_tts_ready(resp["id"])
                         logger.info("[GEN] id=%d ready (cached)", resp["id"])
                     else:
-                        # Генерация провалилась — пропускаем звук, даём Lua показать текст
-                        logger.warning(
-                            "[GEN] id=%d FAILED, marking ready without audio", resp["id"]
-                        )
+                        logger.warning("[GEN] id=%d FAILED, marking ready without audio", resp["id"])
                         self._mark_tts_ready(resp["id"])
 
-                # === ЭТАП 2: Воспроизведение звука ===
-                to_play = self._fetch_to_play()
+                # === ЭТАП 2: Воспроизведение ===
                 for resp in to_play:
                     audio_data = self._audio_cache.pop(resp["id"], None)
+                    self._cache_time.pop(resp["id"], None)
                     if audio_data:
                         logger.info("[PLAY] Playing id=%d", resp["id"])
                         self._play_audio(audio_data)
                         self._mark_tts_delivered(resp["id"])
                         logger.info("[PLAY] id=%d delivered", resp["id"])
                     else:
-                        # Аудио потерялось из кэша (перезапуск воркера?)
-                        logger.warning(
-                            "[PLAY] Cache miss for id=%d, skipping audio", resp["id"]
-                        )
+                        logger.warning("[PLAY] Cache miss for id=%d, skipping audio", resp["id"])
                         self._mark_tts_delivered(resp["id"])
 
-                time.sleep(0.5)
+                # === Умный sleep ===
+                if had_work:
+                    time.sleep(0.1)
+                    self._empty_poll_count = 0
+                else:
+                    self._empty_poll_count += 1
+                    # Чем дольше тишина — тем реже стучим в БД (до 2 сек)
+                    sleep_time = min(0.5 + self._empty_poll_count * 0.1, 2.0)
+                    time.sleep(sleep_time)
+
             except Exception as e:
                 logger.error("Worker loop error: %s", e)
                 time.sleep(2)

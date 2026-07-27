@@ -2,9 +2,10 @@ import os
 import io
 import uvicorn
 import torch
-import tempfile
+import asyncio
+import numpy as np
 
-# FIX for PyTorch 2.6+: XTTS models need weights_only=False
+# FIX for PyTorch 2.6+
 _original_torch_load = torch.load
 def _patched_torch_load(*args, **kwargs):
     if "weights_only" not in kwargs:
@@ -16,13 +17,42 @@ from fastapi import FastAPI
 from fastapi.responses import Response
 from pydantic import BaseModel
 from TTS.api import TTS
+import soundfile as sf
 
 app = FastAPI()
 
+# ═══════════════════════════════════════════════════════════════
+# CPU-оптимизации PyTorch
+# ═══════════════════════════════════════════════════════════════
+torch.set_num_threads(4)          # не съедать все ядра Ultra 5
+torch.set_num_interop_threads(2)
+
 device = "cpu"
-print(f"[XTTS-v2] Loading model on {device}...")
+print(f"[XTTS-v2] Loading model on {device} (threads={torch.get_num_threads()})...")
 tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-print("[XTTS-v2] Ready on http://localhost:5002")
+print("[XTTS-v2] Ready on http://localhost:5003")
+
+# Не более 2 одновременных генераций — предотвращает RAM-спайк
+tts_semaphore = asyncio.Semaphore(2)
+
+# Кэш: путь к ref_audio -> (gpt_cond_latent, speaker_embedding)
+# ЭТО ГЛАВНАЯ ЭКОНОМИЯ. Один раз вычислили — переиспользуем.
+_speaker_cache: dict[str, tuple | None] = {}
+
+def _get_cached_latents(ref_audio_path: str):
+    """Предвычислить и закэшировать speaker conditioning."""
+    if ref_audio_path not in _speaker_cache:
+        try:
+            model = tts.synthesizer.tts_model
+            gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(
+                audio_path=ref_audio_path
+            )
+            _speaker_cache[ref_audio_path] = (gpt_cond_latent, speaker_embedding)
+            print(f"[XTTS] Cached speaker latents: {os.path.basename(ref_audio_path)}")
+        except Exception as e:
+            print(f"[XTTS] Latent cache failed ({e}), will use slow path")
+            _speaker_cache[ref_audio_path] = None
+    return _speaker_cache[ref_audio_path]
 
 
 class TTSRequest(BaseModel):
@@ -36,39 +66,40 @@ async def inference(req: TTSRequest):
     if not os.path.exists(req.ref_audio):
         return Response(content=b"Ref audio not found", status_code=400)
 
-    tmp_path = None
-    try:
-        # Создаём временный файл (удалится автоматически при выходе из with)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
+    async with tts_semaphore:
+        try:
+            latents = _get_cached_latents(req.ref_audio)
 
-        # Генерация через ПРОВЕРЕННЫЙ метод tts_to_file
-        tts.tts_to_file(
-            text=req.text,
-            speaker_wav=req.ref_audio,
-            language="ru",
-            file_path=tmp_path,
-        )
+            if latents is not None:
+                # Быстрый путь: reused latents, без повторной загрузки wav
+                gpt_cond_latent, speaker_embedding = latents
+                out = tts.synthesizer.tts_model.inference(
+                    req.text,
+                    language="ru",
+                    gpt_cond_latent=gpt_cond_latent,
+                    speaker_embedding=speaker_embedding,
+                )
+                # Нормализация выхода под разные версии Coqui TTS
+                wav = out.get("wav") if isinstance(out, dict) else out
+                if isinstance(wav, torch.Tensor):
+                    wav = wav.cpu().numpy()
+            else:
+                # Fallback: стандартный метод, но без записи на диск
+                wav = tts.tts(text=req.text, speaker_wav=req.ref_audio, language="ru")
+                if isinstance(wav, list):
+                    wav = np.array(wav, dtype=np.float32)
 
-        # Читаем сгенерированный файл в RAM
-        with open(tmp_path, "rb") as f:
-            data = f.read()
+            # Пишем WAV прямо в RAM, без tempfile на диске
+            buf = io.BytesIO()
+            sf.write(buf, wav, 24000, format="WAV")
+            buf.seek(0)
+            return Response(content=buf.read(), media_type="audio/wav")
 
-        return Response(content=data, media_type="audio/wav")
-
-    except Exception as e:
-        import traceback
-        err = f"XTTS Error: {e}\n{traceback.format_exc()}"
-        print(err)
-        return Response(content=err.encode(), status_code=500)
-
-    finally:
-        # ВАЖНО: удаляем временный файл в любом случае
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception as del_err:
-                print(f"[XTTS-v2] Failed to remove temp file: {del_err}")
+        except Exception as e:
+            import traceback
+            err = f"XTTS Error: {e}\n{traceback.format_exc()}"
+            print(err)
+            return Response(content=err.encode(), status_code=500)
 
 
 if __name__ == "__main__":

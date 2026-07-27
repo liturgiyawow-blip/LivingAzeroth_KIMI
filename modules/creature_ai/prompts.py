@@ -304,7 +304,8 @@ def build_system_prompt(npc_profile: dict, world_context: dict,
 
 
 def build_bot_system_prompt(bot_profile: dict, world_context: dict,
-                            player_data: dict, channel: str = "SAY-BOT") -> str:
+                            player_data: dict, channel: str = "SAY-BOT",
+                            memory_context: str = "") -> str:
     bot_name = bot_profile.get("name", "Unknown")
     bot_race = bot_profile.get("race", "Unknown")
     bot_class = bot_profile.get("class", "Unknown")
@@ -340,6 +341,17 @@ def build_bot_system_prompt(bot_profile: dict, world_context: dict,
         channel_desc = "Это сообщение в ГРУППЕ — другие спутники слышат. Отвечай соответственно."
     elif channel == "SAY-BOT":
         channel_desc = "Это обычная речь рядом — все рядом слышат. Говори как в таверне или на привале."
+
+    memory_block = ""
+    if memory_context:
+        memory_block = f"""
+═══════════════════════════════════════════════════════════════════
+ТВОЯ ПАМЯТЬ (это то, что всплыло в голове прямо сейчас):
+═══════════════════════════════════════════════════════════════════
+{memory_context}
+
+НЕ произноси всё это вслух сразу. Используй только то, что уместно в ответе. Пусть воспоминания просачиваются естественно, как у живого человека.
+"""
     
     race_block = _build_race_identity(bot_race) if bot_race and bot_race != "Unknown" else ""
     class_block = _build_class_dogma(bot_class) if bot_class and bot_class != "Unknown" else ""
